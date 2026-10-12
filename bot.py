@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import os
-from itertools import combinations
+import re
 from datetime import datetime, timedelta, timezone
+from itertools import combinations
 from zoneinfo import ZoneInfo
 
 import requests
@@ -10,436 +11,279 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+log = logging.getLogger('odds-copilot')
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+KEY = os.getenv('API_FOOTBALL_KEY')
+URL = 'https://v3.football.api-sports.io'
+LOCAL = ZoneInfo('Europe/Bucharest')
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-API_KEY = os.getenv("API_FOOTBALL_KEY")
-API_URL = "https://v3.football.api-sports.io"
-RO_TIME = ZoneInfo("Europe/Bucharest")
 
-
-def api_get(endpoint, params):
-    response = requests.get(
-        f"{API_URL}/{endpoint}",
-        headers={"x-apisports-key": API_KEY},
-        params=params,
-        timeout=20,
-    )
+def api(path, params):
+    response = requests.get(f'{URL}/{path}', headers={'x-apisports-key': KEY}, params=params, timeout=20)
     response.raise_for_status()
-    data = response.json()
-    if data.get("errors"):
-        raise ValueError(str(data["errors"]))
-    return data
+    result = response.json()
+    if result.get('errors'):
+        raise ValueError(str(result['errors']))
+    return result.get('response', [])
 
 
-def fetch_fixtures(hours=2):
+def fixtures(hours=6):
     now = datetime.now(timezone.utc)
     end = now + timedelta(hours=hours)
-    dates = sorted({now.date().isoformat(), end.date().isoformat()})
-    matches = []
-
-    for day in dates:
-        data = api_get("fixtures", {"date": day, "timezone": "UTC"})
-        for match in data.get("response", []):
-            date_text = match.get("fixture", {}).get("date")
-            if not date_text:
+    found = []
+    for day in sorted({now.date().isoformat(), end.date().isoformat()}):
+        for game in api('fixtures', {'date': day, 'timezone': 'UTC'}):
+            stamp = game.get('fixture', {}).get('date')
+            if not stamp:
                 continue
-            kickoff = datetime.fromisoformat(
-                date_text.replace("Z", "+00:00")
-            ).astimezone(timezone.utc)
-            if now <= kickoff <= end:
-                matches.append((kickoff, match))
-
-    return sorted(matches, key=lambda item: item[0])
+            kick = datetime.fromisoformat(stamp.replace('Z', '+00:00')).astimezone(timezone.utc)
+            if now <= kick <= end:
+                found.append((kick, game))
+    return sorted(found, key=lambda x: x[0])
 
 
-def fetch_odds_sample():
-    matches = fetch_fixtures(hours=2)
-    if not matches:
-        return [], 0, "Nu sunt meciuri în următoarele 2 ore."
+def odds_for(kick, game):
+    fix, league = game['fixture'], game['league']
+    if not fix.get('id') or not league.get('id') or league.get('season') is None:
+        return []
+    return api('odds', {'fixture': fix['id'], 'league': league['id'],
+                        'season': league['season'], 'date': kick.date().isoformat()})
 
-    checked = 0
-    results = []
-    for kickoff, match in matches[:5]:
-        fixture = match.get("fixture", {})
-        league = match.get("league", {})
-        teams = match.get("teams", {})
-        season = league.get("season")
-        fixture_id = fixture.get("id")
-        league_id = league.get("id")
-        if not fixture_id or not league_id or season is None:
+
+def recent_games(team_id, cache):
+    if team_id in cache:
+        return cache[team_id]
+    records = []
+    for game in api('fixtures', {'team': team_id, 'last': 15}):
+        sides, goals = game.get('teams', {}), game.get('goals', {})
+        home, away = sides.get('home', {}), sides.get('away', {})
+        gh, ga = goals.get('home'), goals.get('away')
+        if gh is None or ga is None:
             continue
-
-        checked += 1
-        data = api_get(
-            "odds",
-            {
-                "fixture": fixture_id,
-                "league": league_id,
-                "season": season,
-                "date": kickoff.date().isoformat(),
-            },
-        )
-        for item in data.get("response", []):
-            for bookmaker in item.get("bookmakers", [])[:1]:
-                bets = bookmaker.get("bets", [])
-                if not bets:
-                    continue
-                market = next((bet for bet in bets if bet.get("id") == 1), bets[0])
-                values = market.get("values", [])[:3]
-                if not values:
-                    continue
-                results.append({
-                    "home": teams.get("home", {}).get("name", "?"),
-                    "away": teams.get("away", {}).get("name", "?"),
-                    "time": kickoff.astimezone(RO_TIME).strftime("%H:%M"),
-                    "bookmaker": bookmaker.get("name", "?"),
-                    "market": market.get("name", "?"),
-                    "values": values,
-                })
-                break
-    return results, checked, ""
+        if home.get('id') == team_id:
+            records.append({'venue': 'home', 'for': gh, 'against': ga, 'total': gh + ga,
+                            'btts': gh > 0 and ga > 0})
+        elif away.get('id') == team_id:
+            records.append({'venue': 'away', 'for': ga, 'against': gh, 'total': gh + ga,
+                            'btts': ga > 0 and gh > 0})
+    cache[team_id] = records
+    return records
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 Odds Copilot este online!\n\n"
-        "Comenzi:\n"
-        "/status - stare bot\n"
-        "/meciuri - meciuri în următoarele 2 ore\n"
-        "/cote - test cote disponibile\n"
-        "/dubla - caută o dublă de test (~2.00)\n"
-        "/analiza - test statistici goluri și BTTS"
-    )
+def exact_goal_market(market_id, label):
+    """Only whole/half goal lines with binary settlement; exclude quarter Asian lines."""
+    if market_id == 8 and label.lower() in ('yes', 'no'):
+        return ('btts', label.lower() == 'yes', None)
+    if market_id != 5:
+        return None
+    match = re.fullmatch(r'(Over|Under)\s+(\d+(?:\.\d+)?)', label, flags=re.I)
+    if not match:
+        return None
+    threshold = float(match.group(2))
+    # Half-goal totals settle without push, unlike integer and quarter-goal lines.
+    if abs(threshold % 1 - 0.5) > 1e-8:
+        return None
+    return ('goals', match.group(1).lower() == 'over', threshold)
 
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Odds Copilot funcționează.")
+def sample_frequency(games, market):
+    kind, positive, threshold = market
+    if kind == 'btts':
+        hits = sum(g['btts'] == positive for g in games)
+    else:
+        hits = sum((g['total'] > threshold) == positive for g in games)
+    return hits, len(games)
 
 
-async def meciuri(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not API_KEY:
-        await update.message.reply_text("❌ Lipsește API_FOOTBALL_KEY în Railway.")
-        return
-    await update.message.reply_text("🔎 Caut meciuri în următoarele 2 ore...")
-    try:
-        matches = await asyncio.to_thread(fetch_fixtures, 2)
-    except Exception as exc:
-        logger.exception("Eroare la meciuri")
-        await update.message.reply_text(f"❌ Eroare API: {str(exc)[:500]}")
-        return
-
-    if not matches:
-        await update.message.reply_text("⚽ Nu sunt meciuri disponibile în următoarele 2 ore.")
-        return
-
-    lines = [f"⚽ Meciuri în următoarele 2 ore: {len(matches)}"]
-    for kickoff, match in matches[:30]:
-        teams = match.get("teams", {})
-        league = match.get("league", {})
-        local = kickoff.astimezone(RO_TIME)
-        lines.append(
-            f"\n🕒 {local:%H:%M} - "
-            f"{teams.get('home', {}).get('name', '?')} vs "
-            f"{teams.get('away', {}).get('name', '?')}\n"
-            f"🏆 {league.get('name', '?')}"
-        )
-    if len(matches) > 30:
-        lines.append("\nSe afișează primele 30 de meciuri.")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def cote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not API_KEY:
-        await update.message.reply_text("❌ Lipsește API_FOOTBALL_KEY în Railway.")
-        return
-    await update.message.reply_text("🔎 Verific disponibilitatea cotelor...")
-    try:
-        results, checked, note = await asyncio.to_thread(fetch_odds_sample)
-    except Exception as exc:
-        logger.exception("Eroare la cote")
-        await update.message.reply_text(
-            f"⚠️ API-Football a răspuns cu o eroare:\n{str(exc)[:700]}"
-        )
-        return
-
-    if not results:
-        await update.message.reply_text(
-            f"⚠️ Nu am primit cote pentru cele {checked} meciuri verificate.\n{note}"
-        )
-        return
-
-    lines = ["📊 Cote disponibile (test, nu recomandări):"]
-    for item in results[:5]:
-        lines.append(
-            f"\n⚽ {item['time']} - {item['home']} vs {item['away']}\n"
-            f"🏦 {item['bookmaker']} | {item['market']}"
-        )
-        for value in item["values"]:
-            lines.append(f"• {value.get('value', '?')}: {value.get('odd', '?')}")
-    await update.message.reply_text("\n".join(lines))
-
-
-
-def find_double():
-    """Demonstration only: finds two selections, not a statistical forecast."""
-    matches = fetch_fixtures(hours=4)
-    candidates = []
-    checked = 0
-    for kickoff, match in matches[:20]:
-        fixture = match.get("fixture", {})
-        league = match.get("league", {})
-        teams = match.get("teams", {})
-        if not fixture.get("id") or not league.get("id") or league.get("season") is None:
+def analyze():
+    """Conservative descriptive screen; no predictive AI or proven betting edge."""
+    cache, choices = {}, []
+    inspected, qualified = 0, 0
+    for kick, game in fixtures(6)[:12]:
+        teams = game.get('teams', {})
+        h, a = teams.get('home', {}), teams.get('away', {})
+        if not h.get('id') or not a.get('id'):
             continue
-        checked += 1
+        inspected += 1
         try:
-            data = api_get("odds", {
-                "fixture": fixture["id"],
-                "league": league["id"],
-                "season": league["season"],
-                "date": kickoff.date().isoformat(),
-            })
-        except (ValueError, requests.RequestException) as exc:
-            logger.warning("Odds unavailable for %s: %s", fixture["id"], exc)
+            prices = odds_for(kick, game)
+            home = [g for g in recent_games(h['id'], cache) if g['venue'] == 'home'][:8]
+            away = [g for g in recent_games(a['id'], cache) if g['venue'] == 'away'][:8]
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            log.warning('Unavailable analysis data: %s', exc)
             continue
-        for entry in data.get("response", []):
-            for bookmaker in entry.get("bookmakers", []):
-                # Compare both selections at the same bookmaker.
-                for bet in bookmaker.get("bets", []):
-                    if bet.get("id") != 1:  # Match winner (1X2)
-                        continue
-                    for outcome in bet.get("values", []):
-                        try:
-                            odd = float(outcome.get("odd", ""))
-                        except (ValueError, TypeError):
+        if len(home) < 5 or len(away) < 5:
+            continue
+        qualified += 1
+        for entry in prices:
+            for bookmaker in entry.get('bookmakers', []):
+                name = bookmaker.get('name', '?')
+                for bet in bookmaker.get('bets', []):
+                    for outcome in bet.get('values', []):
+                        label = str(outcome.get('value', '')).strip()
+                        market = exact_goal_market(bet.get('id'), label)
+                        if not market:
                             continue
-                        if not 1.25 <= odd <= 1.75:
-                            continue
-                        candidates.append({
-                            "fixture_id": fixture["id"],
-                            "time": kickoff,
-                            "home": teams.get("home", {}).get("name", "?"),
-                            "away": teams.get("away", {}).get("name", "?"),
-                            "bookmaker": bookmaker.get("name", "?"),
-                            "market": bet.get("name", "Match Winner"),
-                            "selection": outcome.get("value", "?"),
-                            "odd": odd,
-                        })
-    best = None
-    best_score = float("inf")
-    for a, b in combinations(candidates, 2):
-        if a["fixture_id"] == b["fixture_id"]:
-            continue
-        if a["bookmaker"] != b["bookmaker"]:
-            continue
-        combined = a["odd"] * b["odd"]
-        if not 1.90 <= combined <= 2.10:
-            continue
-        score = abs(combined - 2.00)
-        if score < best_score:
-            best = (a, b, combined)
-            best_score = score
-    return best, checked
-
-
-async def dubla(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not API_KEY:
-        await update.message.reply_text("❌ Lipsește API_FOOTBALL_KEY în Railway.")
-        return
-    await update.message.reply_text("🔎 Caut o dublă demonstrativă pentru următoarele 4 ore...")
-    try:
-        best, checked = await asyncio.to_thread(find_double)
-    except Exception:
-        logger.exception("Eroare la dubla")
-        await update.message.reply_text("❌ Eroare la verificare. Consultă Railway Logs.")
-        return
-    if best is None:
-        await update.message.reply_text(
-            f"Nu am găsit o dublă între 1.90 și 2.10 în {checked} meciuri verificate. "
-            "Nu forțăm o combinație."
-        )
-        return
-    a, b, combined = best
-    lines = ["🧪 Odds Copilot — Dublă demonstrativă", ""]
-    for index, item in enumerate((a, b), start=1):
-        local = item["time"].astimezone(RO_TIME)
-        lines.extend([
-            f"{index}. {item['home']} vs {item['away']} — {local:%H:%M}",
-            f"{item['market']}: {item['selection']} @ {item['odd']:.2f}",
-            f"Probabilitate implicită brută: {100/item['odd']:.1f}%",
-            "",
-        ])
-    lines.extend([
-        f"🏦 Casă: {a['bookmaker']}",
-        f"📊 Cotă combinată: {combined:.2f}",
-        "",
-        "⚠️ Selecție strict matematică, NU analiză AI sau recomandare.",
-        "Probabilitățile implicite includ marja casei; nu reprezintă șanse estimate independent.",
-        "Cotele se pot modifica înainte de începerea meciurilor.",
-    ])
-    await update.message.reply_text("\n".join(lines))
-
-
-
-def analyze_candidates():
-    """Experimental goal/BTTS frequency screen; not a calibrated forecast."""
-    matches = fetch_fixtures(hours=6)
-    team_cache = {}
-    candidates = []
-    checked = 0
-
-    def history(team_id):
-        if team_id not in team_cache:
-            data = api_get("fixtures", {"team": team_id, "last": 8})
-            games = []
-            for item in data.get("response", []):
-                goals = item.get("goals", {})
-                sides = item.get("teams", {})
-                h, a = sides.get("home", {}), sides.get("away", {})
-                hg, ag = goals.get("home"), goals.get("away")
-                if hg is None or ag is None:
-                    continue
-                if h.get("id") == team_id:
-                    games.append((hg, ag))
-                elif a.get("id") == team_id:
-                    games.append((ag, hg))
-            team_cache[team_id] = games
-        return team_cache[team_id]
-
-    for kickoff, match in matches[:10]:
-        fixture = match.get("fixture", {})
-        league = match.get("league", {})
-        teams = match.get("teams", {})
-        home_id = teams.get("home", {}).get("id")
-        away_id = teams.get("away", {}).get("id")
-        if not fixture.get("id") or not league.get("id") or league.get("season") is None:
-            continue
-        if not home_id or not away_id:
-            continue
-        checked += 1
-        try:
-            odds = api_get("odds", {
-                "fixture": fixture["id"], "league": league["id"],
-                "season": league["season"], "date": kickoff.date().isoformat(),
-            })
-            hg, ag = history(home_id), history(away_id)
-        except (requests.RequestException, ValueError) as exc:
-            logger.warning("Statistics unavailable for %s: %s", fixture["id"], exc)
-            continue
-        if len(hg) < 5 or len(ag) < 5:
-            continue
-        observations = hg + ag
-        n = len(observations)
-        for entry in odds.get("response", []):
-            for bookmaker in entry.get("bookmakers", []):
-                for market in bookmaker.get("bets", []):
-                    market_id = market.get("id")
-                    if market_id not in (5, 8):
-                        continue
-                    for outcome in market.get("values", []):
-                        label = str(outcome.get("value", "")).strip()
                         try:
-                            odd = float(outcome.get("odd"))
+                            odd = float(outcome.get('odd'))
                         except (TypeError, ValueError):
                             continue
                         if not 1.25 <= odd <= 1.85:
                             continue
-                        hits = None
-                        if market_id == 8 and label.lower() in ("yes", "no"):
-                            yes = label.lower() == "yes"
-                            hits = sum(((sc > 0 and co > 0) == yes) for sc, co in observations)
-                        elif market_id == 5:
-                            parts = label.split()
-                            if len(parts) == 2 and parts[0].lower() in ("over", "under"):
-                                try:
-                                    threshold = float(parts[1])
-                                except ValueError:
-                                    continue
-                                over = parts[0].lower() == "over"
-                                hits = sum(((sc + co > threshold) == over) for sc, co in observations)
-                        if hits is None:
+                        hh, hn = sample_frequency(home, market)
+                        ah, an = sample_frequency(away, market)
+                        # Descriptive consistency filter; not a modelled match probability.
+                        home_rate, away_rate = hh / hn, ah / an
+                        if min(home_rate, away_rate) < 0.60:
                             continue
-                        # Shrink small samples toward 50%; heuristic only.
-                        frequency = (hits + 3) / (n + 6)
-                        edge_indicator = frequency - (1 / odd)
-                        if edge_indicator < 0.03:
-                            continue
-                        candidates.append({
-                            "fixture_id": fixture["id"], "time": kickoff,
-                            "home": teams["home"].get("name", "?"),
-                            "away": teams["away"].get("name", "?"),
-                            "bookmaker": bookmaker.get("name", "?"),
-                            "market": market.get("name", "?"),
-                            "selection": label, "odd": odd,
-                            "frequency": frequency, "sample": n,
-                            "edge_indicator": edge_indicator,
+                        choices.append({
+                            'fixture': game['fixture']['id'], 'kick': kick,
+                            'home': h.get('name', '?'), 'away': a.get('name', '?'),
+                            'bookmaker': name, 'market': bet.get('name', '?'),
+                            'selection': label, 'odd': odd,
+                            'home_hits': hh, 'home_n': hn, 'away_hits': ah, 'away_n': an,
+                            'consistency': min(home_rate, away_rate),
                         })
-
-    candidates.sort(key=lambda x: x["edge_indicator"], reverse=True)
-    best, best_score = None, float("-inf")
-    for a, b in combinations(candidates[:120], 2):
-        if a["fixture_id"] == b["fixture_id"] or a["bookmaker"] != b["bookmaker"]:
+    # One candidate per fixture/market/selection/bookmaker. Distinct fixtures and same bookmaker.
+    unique = {}
+    for c in choices:
+        unique[(c['fixture'], c['market'], c['selection'], c['bookmaker'])] = c
+    choices = sorted(unique.values(), key=lambda c: (-c['consistency'], -c['odd']))[:150]
+    best, rank = None, float('-inf')
+    for x, y in combinations(choices, 2):
+        if x['fixture'] == y['fixture'] or x['bookmaker'] != y['bookmaker']:
             continue
-        combined = a["odd"] * b["odd"]
+        combined = x['odd'] * y['odd']
         if not 1.90 <= combined <= 2.10:
             continue
-        score = a["edge_indicator"] + b["edge_indicator"] - abs(combined - 2.0) / 10
-        if score > best_score:
-            best, best_score = (a, b, combined), score
-    return best, checked, len(candidates)
+        score = min(x['consistency'], y['consistency']) - abs(combined - 2) * 0.2
+        if score > rank:
+            best, rank = (x, y, combined), score
+    return best, inspected, qualified, len(choices)
+
+
+def find_double():
+    candidates, inspected = [], 0
+    for kick, game in fixtures(4)[:20]:
+        inspected += 1
+        try:
+            prices = odds_for(kick, game)
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            log.warning('No odds: %s', exc)
+            continue
+        for entry in prices:
+            for book in entry.get('bookmakers', []):
+                for bet in book.get('bets', []):
+                    if bet.get('id') != 1:
+                        continue
+                    for val in bet.get('values', []):
+                        try:
+                            odd = float(val.get('odd'))
+                        except (TypeError, ValueError):
+                            continue
+                        if 1.25 <= odd <= 1.75:
+                            candidates.append({'fixture': game['fixture']['id'], 'kick': kick,
+                                               'home': game['teams']['home']['name'],
+                                               'away': game['teams']['away']['name'],
+                                               'bookmaker': book.get('name', '?'),
+                                               'market': bet.get('name', '?'),
+                                               'selection': val.get('value', '?'), 'odd': odd})
+    best, distance = None, float('inf')
+    for x, y in combinations(candidates, 2):
+        if x['fixture'] == y['fixture'] or x['bookmaker'] != y['bookmaker']:
+            continue
+        combined = x['odd'] * y['odd']
+        if 1.90 <= combined <= 2.10 and abs(combined - 2) < distance:
+            best, distance = (x, y, combined), abs(combined - 2)
+    return best, inspected
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🤖 Odds Copilot online!\n/status - status\n/meciuri - upcoming fixtures\n/cote - sample odds\n/dubla - mathematical 1X2 test\n/analiza - goal/BTTS statistical test')
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('✅ Odds Copilot funcționează.')
+
+
+async def meciuri(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🔎 Checking fixtures...')
+    try:
+        games = await asyncio.to_thread(fixtures, 2)
+        lines = [f'⚽ Fixtures in next 2 hours: {len(games)}']
+        for kick, game in games[:30]:
+            lines.append(f"{kick.astimezone(LOCAL):%H:%M} {game['teams']['home']['name']} vs {game['teams']['away']['name']}")
+        await update.message.reply_text('\n'.join(lines)[:4000])
+    except Exception:
+        log.exception('Fixtures failed')
+        await update.message.reply_text('❌ API error. Check Railway logs.')
+
+
+async def cote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🔎 Checking bookmaker odds...')
+    try:
+        games = await asyncio.to_thread(fixtures, 2)
+        lines = ['📊 Sample odds (not recommendations):']
+        for kick, game in games[:5]:
+            for entry in await asyncio.to_thread(odds_for, kick, game):
+                for book in entry.get('bookmakers', [])[:1]:
+                    bet = next((b for b in book.get('bets', []) if b.get('id') == 1), None)
+                    if bet:
+                        values = ', '.join(f"{v.get('value')}: {v.get('odd')}" for v in bet.get('values', []))
+                        lines.append(f"{kick.astimezone(LOCAL):%H:%M} {game['teams']['home']['name']} vs {game['teams']['away']['name']}\n{book.get('name')}: {values}")
+        await update.message.reply_text('\n\n'.join(lines)[:4000])
+    except Exception:
+        log.exception('Odds failed')
+        await update.message.reply_text('❌ API error. Check Railway logs.')
+
+
+async def dubla(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🔎 Searching mathematical double...')
+    try:
+        best, count = await asyncio.to_thread(find_double)
+        if not best:
+            await update.message.reply_text(f'No qualifying 1X2 double among {count} fixtures.')
+            return
+        x, y, total = best
+        lines = ['🧪 Mathematical double (not analysis):']
+        for c in (x, y):
+            lines.append(f"{c['home']} vs {c['away']} — {c['kick'].astimezone(LOCAL):%H:%M}\n{c['selection']} @ {c['odd']:.2f}")
+        lines.append(f"Bookmaker: {x['bookmaker']}\nCombined: {total:.2f}\n⚠️ No statistical forecast.")
+        await update.message.reply_text('\n\n'.join(lines))
+    except Exception:
+        log.exception('Double failed')
+        await update.message.reply_text('❌ Error. Check Railway logs.')
 
 
 async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not API_KEY:
-        await update.message.reply_text("❌ Lipsește API_FOOTBALL_KEY în Railway.")
-        return
-    await update.message.reply_text("🔎 Checking recent goal statistics and bookmaker odds...")
+    await update.message.reply_text('🔎 Checking home/away goal statistics and bookmaker odds...')
     try:
-        best, checked, count = await asyncio.to_thread(analyze_candidates)
+        best, checked, qualified, choices = await asyncio.to_thread(analyze)
+        if not best:
+            await update.message.reply_text(f'📊 Checked {checked} fixtures; {qualified} had enough home/away data; {choices} odds passed the descriptive screen. No double near 2.00. No picks forced.')
+            return
+        x, y, total = best
+        lines = ['🧪 Odds Copilot — home/away statistical screen (NOT AI prediction)']
+        for i, c in enumerate((x, y), 1):
+            lines.append(f"{i}. {c['home']} vs {c['away']} — {c['kick'].astimezone(LOCAL):%H:%M}\n{c['market']}: {c['selection']} @ {c['odd']:.2f}\nBookmaker: {c['bookmaker']}\nHome team, at home: {c['home_hits']}/{c['home_n']} matches\nAway team, away: {c['away_hits']}/{c['away_n']} matches\nRaw implied probability: {1/c['odd']:.1%}")
+        lines.append(f'Combined odds: {total:.2f}')
+        lines.append('⚠️ Experimental historical-frequency filter only, NOT calibrated probabilities, AI prediction, or evidence of betting value. Quarter/integer Asian totals excluded. No corner/card analysis or automatic publishing. Odds may change.')
+        await update.message.reply_text('\n\n'.join(lines))
     except Exception:
-        logger.exception("Analysis failed")
-        await update.message.reply_text("❌ Analysis failed. Check Railway Logs.")
-        return
-    if best is None:
-        await update.message.reply_text(
-            f"📊 Checked {checked} fixtures. {count} candidate odds passed "
-            "the preliminary screen, but no double near 2.00 was found. "
-            "No picks forced."
-        )
-        return
-    a, b, combined = best
-    lines = ["🧪 Odds Copilot — Statistical test (NOT AI prediction)", ""]
-    for i, item in enumerate((a, b), 1):
-        local = item["time"].astimezone(RO_TIME)
-        lines.extend([
-            f"{i}. {item['home']} vs {item['away']} — {local:%H:%M}",
-            f"{item['market']}: {item['selection']} @ {item['odd']:.2f}",
-            f"Bookmaker: {item['bookmaker']}",
-            f"Smoothed recent frequency: {item['frequency']:.1%} ({item['sample']} observations)",
-            f"Raw implied probability: {1/item['odd']:.1%}", "",
-        ])
-    lines.extend([
-        f"Combined odds: {combined:.2f}", "",
-        "⚠️ Experimental screening only. Recent frequencies are not calibrated "
-        "probabilities or evidence of value. No corner/card or injury analysis yet. "
-        "No automatic publishing. Odds can change.",
-    ])
-    await update.message.reply_text("\n".join(lines))
+        log.exception('Analysis failed')
+        await update.message.reply_text('❌ Analysis error. Check Railway logs.')
+
 
 def main():
-    if not TOKEN:
-        raise RuntimeError("Lipsește TELEGRAM_BOT_TOKEN în Railway.")
-    application = Application.builder().token(TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("meciuri", meciuri))
-    application.add_handler(CommandHandler("cote", cote))
-    application.add_handler(CommandHandler("dubla", dubla))
-    application.add_handler(CommandHandler("analiza", analiza))
-    logger.info("Odds Copilot pornit")
-    application.run_polling()
+    if not TOKEN or not KEY:
+        raise RuntimeError('Missing TELEGRAM_BOT_TOKEN or API_FOOTBALL_KEY in Railway')
+    app = Application.builder().token(TOKEN).build()
+    for command, handler in [('start', start), ('status', status), ('meciuri', meciuri),
+                             ('cote', cote), ('dubla', dubla), ('analiza', analiza)]:
+        app.add_handler(CommandHandler(command, handler))
+    log.info('Odds Copilot started')
+    app.run_polling()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
