@@ -63,9 +63,10 @@ def fetch_odds_sample():
         fixture = match.get("fixture", {})
         league = match.get("league", {})
         teams = match.get("teams", {})
+        season = league.get("season")
         fixture_id = fixture.get("id")
         league_id = league.get("id")
-        if not fixture_id or not league_id:
+        if not fixture_id or not league_id or season is None:
             continue
 
         checked += 1
@@ -74,6 +75,7 @@ def fetch_odds_sample():
             {
                 "fixture": fixture_id,
                 "league": league_id,
+                "season": season,
                 "date": kickoff.date().isoformat(),
             },
         )
