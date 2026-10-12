@@ -128,44 +128,72 @@ async def meciuri(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def fetch_odds_sample():
-    # Un singur apel pentru testarea accesului la cote.
-    data = api_get("odds", {"page": 1})
-    items = data.get("response", [])
+
+def fetch_odds_sample():
+    matches = fetch_fixtures(2)
+
+    if not matches:
+        return [], 0
+
+    # Testăm maximum 3 meciuri, pentru a economisi
+    # cererile disponibile în abonamentul API.
     results = []
+    checked = 0
 
-    for item in items[:5]:
-        fixture = item.get("fixture", {})
-        league = item.get("league", {})
-        bookmakers = item.get("bookmakers", [])
+    for kickoff, match in matches[:3]:
+        fixture = match.get("fixture", {})
+        league = match.get("league", {})
+        teams = match.get("teams", {})
 
-        if not bookmakers:
+        fixture_id = fixture.get("id")
+        league_id = league.get("id")
+
+        if not fixture_id or not league_id:
             continue
 
-        book = bookmakers[0]
-        bets = book.get("bets", [])
+        checked += 1
 
-        if not bets:
-            continue
-
-        bet = next(
-            (b for b in bets if b.get("id") == 1),
-            bets[0]
+        data = api_get(
+            "odds",
+            {
+                "fixture": fixture_id,
+                "league": league_id,
+                "date": kickoff.strftime("%Y-%m-%d"),
+            },
         )
 
-        outcomes = bet.get("values", [])[:3]
+        for item in data.get("response", []):
+            bookmakers = item.get("bookmakers", [])
 
-        results.append({
-            "fixture_id": fixture.get("id", "?"),
-            "league": league.get("name", "?"),
-            "bookmaker": book.get("name", "?"),
-            "market": bet.get("name", "?"),
-            "outcomes": [
-                (o.get("value", "?"), o.get("odd", "?"))
-                for o in outcomes
-            ],
-        })
+            if not bookmakers:
+                continue
 
-    return results, data.get("results", 0)
+            book = bookmakers[0]
+            bets = book.get("bets", [])
+
+            if not bets:
+                continue
+
+            bet = next(
+                (b for b in bets if b.get("id") == 1),
+                bets[0]
+            )
+
+            results.append({
+                "fixture_id": fixture_id,
+                "league": league.get("name", "?"),
+                "bookmaker": book.get("name", "?"),
+                "market": bet.get("name", "?"),
+                "outcomes": [
+                    (o.get("value", "?"), o.get("odd", "?"))
+                    for o in bet.get("values", [])[:3]
+                ],
+            })
+
+            break
+
+    return results, checked
+
 
 
 async def cote(update: Update, context: ContextTypes.DEFAULT_TYPE):
