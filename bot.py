@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from itertools import combinations
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -106,7 +107,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Comenzi:\n"
         "/status - stare bot\n"
         "/meciuri - meciuri în următoarele 2 ore\n"
-        "/cote - test cote disponibile"
+        "/cote - test cote disponibile\n"
+        "/dubla - caută o dublă de test (~2.00)"
     )
 
 
@@ -177,6 +179,107 @@ async def cote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+
+def find_double():
+    """Demonstration only: finds two selections, not a statistical forecast."""
+    matches = fetch_fixtures(hours=4)
+    candidates = []
+    checked = 0
+    for kickoff, match in matches[:20]:
+        fixture = match.get("fixture", {})
+        league = match.get("league", {})
+        teams = match.get("teams", {})
+        if not fixture.get("id") or not league.get("id") or league.get("season") is None:
+            continue
+        checked += 1
+        try:
+            data = api_get("odds", {
+                "fixture": fixture["id"],
+                "league": league["id"],
+                "season": league["season"],
+                "date": kickoff.date().isoformat(),
+            })
+        except (ValueError, requests.RequestException) as exc:
+            logger.warning("Odds unavailable for %s: %s", fixture["id"], exc)
+            continue
+        for entry in data.get("response", []):
+            for bookmaker in entry.get("bookmakers", []):
+                # Compare both selections at the same bookmaker.
+                for bet in bookmaker.get("bets", []):
+                    if bet.get("id") != 1:  # Match winner (1X2)
+                        continue
+                    for outcome in bet.get("values", []):
+                        try:
+                            odd = float(outcome.get("odd", ""))
+                        except (ValueError, TypeError):
+                            continue
+                        if not 1.25 <= odd <= 1.75:
+                            continue
+                        candidates.append({
+                            "fixture_id": fixture["id"],
+                            "time": kickoff,
+                            "home": teams.get("home", {}).get("name", "?"),
+                            "away": teams.get("away", {}).get("name", "?"),
+                            "bookmaker": bookmaker.get("name", "?"),
+                            "market": bet.get("name", "Match Winner"),
+                            "selection": outcome.get("value", "?"),
+                            "odd": odd,
+                        })
+    best = None
+    best_score = float("inf")
+    for a, b in combinations(candidates, 2):
+        if a["fixture_id"] == b["fixture_id"]:
+            continue
+        if a["bookmaker"] != b["bookmaker"]:
+            continue
+        combined = a["odd"] * b["odd"]
+        if not 1.90 <= combined <= 2.10:
+            continue
+        score = abs(combined - 2.00)
+        if score < best_score:
+            best = (a, b, combined)
+            best_score = score
+    return best, checked
+
+
+async def dubla(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not API_KEY:
+        await update.message.reply_text("❌ Lipsește API_FOOTBALL_KEY în Railway.")
+        return
+    await update.message.reply_text("🔎 Caut o dublă demonstrativă pentru următoarele 4 ore...")
+    try:
+        best, checked = await asyncio.to_thread(find_double)
+    except Exception:
+        logger.exception("Eroare la dubla")
+        await update.message.reply_text("❌ Eroare la verificare. Consultă Railway Logs.")
+        return
+    if best is None:
+        await update.message.reply_text(
+            f"Nu am găsit o dublă între 1.90 și 2.10 în {checked} meciuri verificate. "
+            "Nu forțăm o combinație."
+        )
+        return
+    a, b, combined = best
+    lines = ["🧪 Odds Copilot — Dublă demonstrativă", ""]
+    for index, item in enumerate((a, b), start=1):
+        local = item["time"].astimezone(RO_TIME)
+        lines.extend([
+            f"{index}. {item['home']} vs {item['away']} — {local:%H:%M}",
+            f"{item['market']}: {item['selection']} @ {item['odd']:.2f}",
+            f"Probabilitate implicită brută: {100/item['odd']:.1f}%",
+            "",
+        ])
+    lines.extend([
+        f"🏦 Casă: {a['bookmaker']}",
+        f"📊 Cotă combinată: {combined:.2f}",
+        "",
+        "⚠️ Selecție strict matematică, NU analiză AI sau recomandare.",
+        "Probabilitățile implicite includ marja casei; nu reprezintă șanse estimate independent.",
+        "Cotele se pot modifica înainte de începerea meciurilor.",
+    ])
+    await update.message.reply_text("\n".join(lines))
+
+
 def main():
     if not TOKEN:
         raise RuntimeError("Lipsește TELEGRAM_BOT_TOKEN în Railway.")
@@ -185,6 +288,7 @@ def main():
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("meciuri", meciuri))
     application.add_handler(CommandHandler("cote", cote))
+    application.add_handler(CommandHandler("dubla", dubla))
     logger.info("Odds Copilot pornit")
     application.run_polling()
 
