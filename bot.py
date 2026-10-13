@@ -20,6 +20,8 @@ KEY = os.getenv('API_FOOTBALL_KEY')
 URL = 'https://v3.football.api-sports.io'
 LOCAL = ZoneInfo('Europe/Bucharest')
 DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
+AUTO_SCAN_HOURS = 4
+SCAN_LIMIT_PER_DAY = 8
 
 
 def api(path, params):
@@ -223,11 +225,11 @@ def find_double():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🤖 Odds Copilot 2.3 online!\n/status - status\n/meciuri - upcoming fixtures\n/cote - sample odds\n/dubla - mathematical 1X2 test\n/analiza - Poisson model\n/istoric - saved doubles\n/statistici - ROI and results\n/verifica - refresh final scores')
+    await update.message.reply_text('🤖 Odds Copilot 2.4 online!\n/status - status\n/meciuri - upcoming fixtures\n/cote - sample odds\n/dubla - mathematical 1X2 test\n/analiza - Poisson model\n/istoric - saved doubles\n/statistici - ROI and results\n/verifica - refresh final scores')
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('✅ Odds Copilot 2.3 funcționează.')
+    await update.message.reply_text('✅ Odds Copilot 2.4 funcționează.')
 
 
 async def meciuri(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -305,6 +307,15 @@ def db_connect():
         status TEXT NOT NULL DEFAULT 'pending',
         home_goals INTEGER, away_goals INTEGER
     )''')
+    con.execute('''CREATE TABLE IF NOT EXISTS scan_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scanned_at TEXT NOT NULL,
+        status TEXT NOT NULL,
+        checked INTEGER NOT NULL DEFAULT 0,
+        qualified INTEGER NOT NULL DEFAULT 0,
+        candidates INTEGER NOT NULL DEFAULT 0,
+        detail TEXT NOT NULL DEFAULT ''
+    )''')
     con.commit()
     return con
 
@@ -317,6 +328,13 @@ def save_double(best):
         for c in (x, y)
     ))
     with db_connect() as con:
+        # Do not reuse fixtures already included in ANY recorded double.
+        existing = con.execute(
+            'SELECT 1 FROM legs WHERE fixture_id IN (?,?) LIMIT 1',
+            (x['fixture'], y['fixture'])
+        ).fetchone()
+        if existing:
+            return False
         cur = con.execute(
             'INSERT OR IGNORE INTO doubles(created_at,fingerprint,bookmaker,combined_odds) VALUES(?,?,?,?)',
             (datetime.now(timezone.utc).isoformat(), fingerprint, x['bookmaker'], total),
@@ -387,7 +405,7 @@ def settle_pending():
 
 
 async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔎 Odds Copilot 2.3 — Running Poisson model...')
+    await update.message.reply_text('🔎 Odds Copilot 2.4 — Running Poisson model...')
     try:
         best, checked, qualified, count = await asyncio.to_thread(analyze)
         if not best:
@@ -398,7 +416,7 @@ async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         saved = await asyncio.to_thread(save_double, best)
         x, y, total = best
-        lines = ['🧪 Odds Copilot 2.3 — Poisson model', 'Experimental statistical analysis', '']
+        lines = ['🧪 Odds Copilot 2.4 — Poisson model', 'Experimental statistical analysis', '']
         for i, c in enumerate((x, y), 1):
             lines.extend([
                 f"{i}. {c['home']} vs {c['away']} — {c['kick'].astimezone(LOCAL):%H:%M}",
@@ -475,6 +493,83 @@ async def verifica(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('❌ Settlement error. Check Railway logs.')
 
 
+def automated_scan():
+    """Run a bounded research scan, without posting or betting."""
+    now = datetime.now(timezone.utc)
+    local_day = now.astimezone(LOCAL).date().isoformat()
+    with db_connect() as con:
+        rows = con.execute('SELECT scanned_at FROM scan_runs ORDER BY id DESC LIMIT 40').fetchall()
+    today_count = sum(datetime.fromisoformat(t).astimezone(LOCAL).date().isoformat() == local_day for (t,) in rows)
+    if today_count >= SCAN_LIMIT_PER_DAY:
+        return 'daily limit reached'
+    try:
+        best, checked, qualified, candidates = analyze()
+        if best:
+            saved = save_double(best)
+            state = 'saved' if saved else 'duplicate_or_reused_fixture'
+        else:
+            state = 'no_qualifying_double'
+        detail = 'research only; no automatic publication'
+    except Exception as exc:
+        log.exception('Automated scan failed')
+        state, checked, qualified, candidates = 'error', 0, 0, 0
+        detail = str(exc)[:250]
+    with db_connect() as con:
+        con.execute('INSERT INTO scan_runs(scanned_at,status,checked,qualified,candidates,detail) VALUES(?,?,?,?,?,?)',
+                    (now.isoformat(), state, checked, qualified, candidates, detail))
+    return state
+
+
+async def scanare(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🔎 Running one research scan...')
+    try:
+        state = await asyncio.to_thread(automated_scan)
+        await update.message.reply_text(f'🧪 Scan: {state}. Use /istoric and /raport. No picks published.')
+    except Exception:
+        log.exception('Manual scan failed')
+        await update.message.reply_text('❌ Scan failed; check Railway logs.')
+
+
+async def raport(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        def read():
+            with db_connect() as con:
+                doubles = con.execute('SELECT created_at,status,combined_odds FROM doubles').fetchall()
+                scans = con.execute('SELECT scanned_at,status FROM scan_runs ORDER BY id DESC LIMIT 200').fetchall()
+            return doubles, scans
+        doubles, scans = await asyncio.to_thread(read)
+        today = datetime.now(LOCAL).date()
+        ds = [(s,o) for t,s,o in doubles if datetime.fromisoformat(t).astimezone(LOCAL).date() == today]
+        ss = [s for t,s in scans if datetime.fromisoformat(t).astimezone(LOCAL).date() == today]
+        wins = sum(s == 'won' for s,_ in ds)
+        losses = sum(s == 'lost' for s,_ in ds)
+        pending = sum(s == 'pending' for s,_ in ds)
+        pnl = sum(o-1 if s == 'won' else -1 for s,o in ds if s in ('won','lost'))
+        settled = wins + losses
+        await update.message.reply_text(
+            f'📊 Research report {today:%d.%m.%Y}\n'
+            f'Scans: {len(ss)} | saved: {ss.count("saved")}\n'
+            f'Doubles created today: {len(ds)}\nWon: {wins} | Lost: {losses} | Pending: {pending}\n'
+            + (f'Theoretical P/L: {pnl:+.2f} units | ROI: {pnl/settled:+.1%}' if settled else 'ROI: not yet available for today')
+            + '\n⚠️ Small samples are not evidence of predictive advantage.'
+        )
+    except Exception:
+        log.exception('Report failed')
+        await update.message.reply_text('❌ Report error; check Railway logs.')
+
+
+async def periodic_scanning(app):
+    # Wait after startup so the first scan is not triggered by each deployment.
+    await asyncio.sleep(300)
+    while True:
+        try:
+            state = await asyncio.to_thread(automated_scan)
+            log.info('Automated research scan: %s', state)
+        except Exception:
+            log.exception('Research scan failed')
+        await asyncio.sleep(AUTO_SCAN_HOURS * 3600)
+
+
 async def periodic_settlement(app):
     while True:
         await asyncio.sleep(1800)
@@ -487,6 +582,7 @@ async def periodic_settlement(app):
 async def on_startup(app):
     await asyncio.to_thread(db_connect_and_close)
     app.create_task(periodic_settlement(app))
+    app.create_task(periodic_scanning(app))
 
 
 def db_connect_and_close():
@@ -500,9 +596,10 @@ def main():
     app = Application.builder().token(TOKEN).post_init(on_startup).build()
     for command, handler in [('start', start), ('status', status), ('meciuri', meciuri),
                              ('cote', cote), ('dubla', dubla), ('analiza', analiza),
-                             ('istoric', istoric), ('statistici', statistici), ('verifica', verifica)]:
+                             ('istoric', istoric), ('statistici', statistici), ('verifica', verifica),
+                             ('scanare', scanare), ('raport', raport)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('Odds Copilot 2.3 started')
+    log.info('Odds Copilot 2.4 started')
     app.run_polling()
 
 
