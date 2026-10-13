@@ -23,7 +23,7 @@ DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 2
 SCAN_LIMIT_PER_DAY = 16
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "3.1-beta"
+VERSION = "3.2-preview"
 MIN_LEAD_MINUTES = 15
 DAILY_DOUBLE_TARGET = 10
 MAX_NEW_DOUBLES_PER_SCAN = 3
@@ -248,11 +248,11 @@ def find_double():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🤖 OddX2 3.1-beta online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/weekly - last completed week\n/monthly - last completed month\n/alltime - published track record\n/diagnostics - scan reasons\n/sports - check basketball and hockey feeds')
+    await update.message.reply_text('🤖 OddX2 3.2-preview online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/weekly - last completed week\n/monthly - last completed month\n/alltime - published track record\n/diagnostics - scan reasons\n/sports - check basketball and hockey feeds\n/basketball - basketball research preview\n/hockey - hockey research preview')
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('✅ OddX2 3.1-beta is online.')
+    await update.message.reply_text('✅ OddX2 3.2-preview is online.')
 
 
 async def meciuri(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -741,7 +741,7 @@ async def sports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ['🏟 OddX2 | MULTISPORT FEEDS', 'Football: active statistical selections']
     for sport, count, state in results:
         lines.append(f'{sport.title()}: {count} games across today/tomorrow | {state}')
-    lines.append('Basketball/Hockey: data discovery only; publishing awaits validated odds and settlement adapters.')
+    lines.append('Basketball/Hockey: research previews available via /basketball and /hockey; automatic publishing disabled pending validation.')
     await update.message.reply_text('\n'.join(lines)[:4000])
 
 
@@ -909,6 +909,144 @@ def db_connect_and_close():
     con.close()
 
 
+
+# 3.2 research-only adapters. They do not write to SQLite or publish picks.
+def ms_finished_score(sport, game):
+    status = game.get('status', {}).get('short')
+    if sport == 'basketball':
+        if status != 'FT':
+            return None
+        scores = game.get('scores') or {}
+        h, a = scores.get('home') or {}, scores.get('away') or {}
+        if h.get('total') is None or a.get('total') is None:
+            return None
+        return int(h['total']), int(a['total'])
+    if status not in ('FT', 'AOT', 'AP'):
+        return None
+    periods = game.get('periods') or {}
+    try:
+        pairs = [tuple(int(n) for n in periods[key].split('-')) for key in ('first', 'second', 'third')]
+        if any(len(pair) != 2 for pair in pairs):
+            return None
+        return sum(x for x, _ in pairs), sum(y for _, y in pairs)
+    except (AttributeError, ValueError, TypeError, KeyError):
+        return None
+
+
+def ms_history(sport, team_id, season, league_id, before, cache):
+    key = (sport, team_id, str(season), league_id)
+    if key not in cache:
+        data = multisport_api(sport, 'games', {'team': team_id, 'season': season, 'league': league_id})
+        records = []
+        for g in data:
+            try:
+                when = datetime.fromisoformat(g['date'].replace('Z', '+00:00')).astimezone(timezone.utc)
+                score = ms_finished_score(sport, g)
+                if score is None:
+                    continue
+                home_id = (g.get('teams', {}).get('home') or {}).get('id')
+                away_id = (g.get('teams', {}).get('away') or {}).get('id')
+                if home_id == team_id:
+                    records.append((when, 'home', score[0], score[1]))
+                elif away_id == team_id:
+                    records.append((when, 'away', score[1], score[0]))
+            except (KeyError, ValueError, TypeError):
+                continue
+        cache[key] = sorted(records, reverse=True)
+    return [r for r in cache[key] if r[0] < before]
+
+
+def ms_preview(sport, limit=5):
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(hours=20)
+    games = []
+    for day in sorted({now.date().isoformat(), end.date().isoformat()}):
+        games.extend(multisport_api(sport, 'games', {'date': day}))
+    upcoming = []
+    for g in games:
+        try:
+            when = datetime.fromisoformat(g['date'].replace('Z', '+00:00')).astimezone(timezone.utc)
+            if now + timedelta(minutes=20) < when <= end:
+                upcoming.append((when, g))
+        except (KeyError, ValueError, TypeError):
+            pass
+    upcoming.sort(key=lambda t: t[0])
+    cache, candidates, checked, qualified, priced = {}, [], 0, 0, 0
+    for when, g in upcoming[:18]:
+        league = g.get('league') or {}
+        teams = g.get('teams') or {}
+        h, a = teams.get('home') or {}, teams.get('away') or {}
+        if not all((h.get('id'), a.get('id'), league.get('id'), league.get('season') is not None)):
+            continue
+        checked += 1
+        try:
+            home = [r for r in ms_history(sport, h['id'], league['season'], league['id'], when, cache) if r[1] == 'home'][:10]
+            away = [r for r in ms_history(sport, a['id'], league['season'], league['id'], when, cache) if r[1] == 'away'][:10]
+            if len(home) < 5 or len(away) < 5:
+                continue
+            qualified += 1
+            expected_home = (sum(r[2] for r in home)/len(home) + sum(r[3] for r in away)/len(away))/2
+            expected_away = (sum(r[2] for r in away)/len(away) + sum(r[3] for r in home)/len(home))/2
+            odds = multisport_api(sport, 'odds', {'game': g['id']})
+            if odds:
+                priced += 1
+            for entry in odds:
+                for book in entry.get('bookmakers', []):
+                    for bet in book.get('bets', []):
+                        # Preview only: no assumed odds settlement semantics.
+                        if bet.get('id') != 4:
+                            continue
+                        for v in bet.get('values', []):
+                            label = str(v.get('value', ''))
+                            match = re.fullmatch(r'(Over|Under)\s+(\d+\.5)', label, re.I)
+                            if not match:
+                                continue
+                            try:
+                                price = float(v['odd'])
+                            except (KeyError, ValueError, TypeError):
+                                continue
+                            if not math.isfinite(price) or not 1.25 <= price <= 1.85:
+                                continue
+                            line = float(match.group(2))
+                            gap = (expected_home + expected_away - line) * (1 if match.group(1).lower() == 'over' else -1)
+                            candidates.append((gap, when, h.get('name','?'), a.get('name','?'), book.get('name','?'), label, price, expected_home + expected_away, len(home), len(away)))
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            log.warning('3.2 %s preview skipped game %s: %s', sport, g.get('id'), exc)
+    candidates.sort(key=lambda r: r[0], reverse=True)
+    # Not probabilities, value bets, or picks. Descriptive differences only.
+    return checked, qualified, priced, candidates[:limit]
+
+
+async def ms_command(update: Update, context: ContextTypes.DEFAULT_TYPE, sport):
+    await update.message.reply_text(f'🔎 OddX2 3.2 | {sport.title()} research preview...')
+    try:
+        checked, qualified, priced, rows = await asyncio.to_thread(ms_preview, sport)
+        lines = [f'🏟 OddX2 3.2 | {sport.upper()} PREVIEW',
+                 f'Upcoming inspected: {checked} | enough history: {qualified} | with odds: {priced}',
+                 'Research only — NOT predictions, betting value, or published selections.']
+        for gap, when, home, away, book, label, price, estimate, hn, an in rows:
+            lines.append(f'{when.astimezone(LOCAL):%d %b %H:%M} | {home} vs {away}\n'
+                         f'{book}: {label} @ {price:.2f} | historical total estimate: {estimate:.1f} '
+                         f'| difference: {gap:+.1f} points/goals | sample {hn}H/{an}A')
+        if not rows:
+            lines.append('No preview candidates with sufficient data and available odds.')
+        if sport == 'hockey':
+            lines.append('Hockey history uses regulation-time goals only. Odds O/U settlement rules remain unverified.')
+        else:
+            lines.append('Basketball total includes final scores; overtime settlement rules remain unverified.')
+        await update.message.reply_text('\n\n'.join(lines)[:4000])
+    except Exception:
+        log.exception('3.2 %s research preview failed', sport)
+        await update.message.reply_text('❌ Research preview unavailable. Check Railway logs.')
+
+
+async def basketball_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ms_command(update, context, 'basketball')
+
+
+async def hockey_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ms_command(update, context, 'hockey')
+
 def main():
     if not TOKEN or not KEY:
         raise RuntimeError('Missing TELEGRAM_BOT_TOKEN or API_FOOTBALL_KEY in Railway')
@@ -925,9 +1063,9 @@ def main():
                              ('report', raport), ('raport', raport),
                              ('weekly', weekly), ('monthly', monthly),
                              ('alltime', alltime), ('diagnostics', diagnostics),
-                             ('sports', sports)]:
+                             ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('OddX2 3.1-beta started')
+    log.info('OddX2 3.2-preview started')
     app.run_polling()
 
 
