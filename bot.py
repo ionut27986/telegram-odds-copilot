@@ -20,10 +20,10 @@ KEY = os.getenv('API_FOOTBALL_KEY')
 URL = 'https://v3.football.api-sports.io'
 LOCAL = ZoneInfo('Europe/Bucharest')
 DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
-AUTO_SCAN_HOURS = 4
-SCAN_LIMIT_PER_DAY = 8
+AUTO_SCAN_HOURS = 2
+SCAN_LIMIT_PER_DAY = 16
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "2.5.1"
+VERSION = "3.0-beta"
 
 
 def api(path, params):
@@ -120,7 +120,7 @@ def analyze():
     """Experimental Poisson estimates; not calibrated betting predictions."""
     cache, choices = {}, []
     inspected, qualified = 0, 0
-    for kick, game in fixtures(6)[:12]:
+    for kick, game in fixtures(20)[:32]:
         teams = game.get('teams', {})
         h, a = teams.get('home', {}), teams.get('away', {})
         if not h.get('id') or not a.get('id'):
@@ -177,6 +177,9 @@ def analyze():
         if key not in unique or c['odd'] > unique[key]['odd']:
             unique[key] = c
     choices = sorted(unique.values(), key=lambda c: c['difference'], reverse=True)[:150]
+    with db_connect() as con:
+        used = {r[0] for r in con.execute('SELECT fixture_id FROM legs')}
+    choices = [c for c in choices if c['fixture'] not in used]
     best, best_score = None, float('-inf')
     for x, y in combinations(choices, 2):
         if x['fixture'] == y['fixture'] or x['bookmaker'] != y['bookmaker']:
@@ -227,11 +230,11 @@ def find_double():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🤖 OddX2 2.5.1 online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/testchannel - channel connection test (admins only)')
+    await update.message.reply_text('🤖 OddX2 3.0-beta online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/weekly - last completed week\n/monthly - last completed month\n/alltime - published track record\n/diagnostics - scan reasons\n/sports - check basketball and hockey feeds')
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('✅ OddX2 2.5.1 is online.')
+    await update.message.reply_text('✅ OddX2 3.0-beta is online.')
 
 
 async def meciuri(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -325,6 +328,13 @@ def db_connect():
         except sqlite3.OperationalError as exc:
             if 'duplicate column name' not in str(exc).lower():
                 raise
+    con.execute('''CREATE TABLE IF NOT EXISTS report_posts (
+        period_type TEXT NOT NULL, period_key TEXT NOT NULL,
+        sent_at TEXT NOT NULL, PRIMARY KEY(period_type,period_key))''')
+    con.execute('''CREATE TABLE IF NOT EXISTS sport_observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at TEXT NOT NULL,
+        sport TEXT NOT NULL, endpoint TEXT NOT NULL, item_count INTEGER NOT NULL,
+        sample TEXT NOT NULL DEFAULT '', status TEXT NOT NULL)''')
     con.commit()
     return con
 
@@ -444,8 +454,7 @@ async def publish_results_and_summary(app):
     outstanding = await asyncio.to_thread(get_unposted_results)
     if outstanding:
         await publish_updates(app)
-        await app.bot.send_message(chat_id=CHANNEL_ID,
-                                   text=await asyncio.to_thread(daily_summary))
+        log.info('Results published; next public summary is weekly/monthly')
 
 
 def settle_pending():
@@ -499,7 +508,7 @@ def settle_pending():
 
 
 async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔎 OddX2 2.5 — Running statistical analysis...')
+    await update.message.reply_text('🔎 OddX2 3.0 — Running statistical analysis...')
     try:
         best, checked, qualified, count = await asyncio.to_thread(analyze)
         if not best:
@@ -510,7 +519,7 @@ async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         saved = await asyncio.to_thread(save_double, best)
         x, y, total = best
-        lines = ['🧪 OddX2 2.5 — Poisson model', 'Experimental statistical analysis', '']
+        lines = ['🧪 OddX2 3.0 — Poisson model', 'Experimental statistical analysis', '']
         for i, c in enumerate((x, y), 1):
             lines.extend([
                 f"{i}. {c['home']} vs {c['away']} — {c['kick'].astimezone(LOCAL):%H:%M}",
@@ -656,6 +665,176 @@ async def raport(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('❌ Report error; check Railway logs.')
 
 
+
+SPORTS = {
+    'basketball': ('https://v1.basketball.api-sports.io', 'API_BASKETBALL_KEY'),
+    'hockey': ('https://v1.hockey.api-sports.io', 'API_HOCKEY_KEY'),
+}
+
+
+def multisport_api(sport, endpoint, params=None):
+    base, env = SPORTS[sport]
+    key = os.getenv(env, '').strip()
+    if not key:
+        raise ValueError(f'Missing {env}')
+    response = requests.get(f'{base}/{endpoint}',
+                            headers={'x-apisports-key': key},
+                            params=params or {}, timeout=20)
+    response.raise_for_status()
+    data = response.json()
+    if data.get('errors'):
+        raise ValueError(str(data['errors']))
+    return data.get('response', [])
+
+
+def observe_sport(sport):
+    # Data discovery only. These APIs do not share the football market schema.
+    # No selection is published until a verified market and settlement adapter exists.
+    endpoint = 'games'
+    today = datetime.now(timezone.utc).date()
+    counts, sample, state = 0, '', 'ok'
+    try:
+        for offset in range(2):
+            games = multisport_api(sport, endpoint, {'date': (today + timedelta(days=offset)).isoformat()})
+            counts += len(games)
+            if games and not sample:
+                game = games[0]
+                # Store keys only: avoid logging private credentials or giant payloads.
+                sample = ','.join(sorted(game.keys()))[:180]
+    except Exception as exc:
+        state = f'{type(exc).__name__}: {str(exc)[:100]}'
+    with db_connect() as con:
+        con.execute('INSERT INTO sport_observations(observed_at,sport,endpoint,item_count,sample,status) VALUES(?,?,?,?,?,?)',
+                    (datetime.now(timezone.utc).isoformat(), sport, endpoint, counts, sample, state))
+    return sport, counts, state
+
+
+def multi_observations():
+    return [observe_sport(sport) for sport in SPORTS]
+
+
+async def sports(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🔎 Checking Basketball and Hockey feeds...')
+    results = await asyncio.to_thread(multi_observations)
+    lines = ['🏟 OddX2 | MULTISPORT FEEDS', 'Football: active statistical selections']
+    for sport, count, state in results:
+        lines.append(f'{sport.title()}: {count} games across today/tomorrow | {state}')
+    lines.append('Basketball/Hockey: data discovery only; publishing awaits validated odds and settlement adapters.')
+    await update.message.reply_text('\n'.join(lines)[:4000])
+
+
+def performance_report(period):
+    now = datetime.now(LOCAL)
+    if period == 'week':
+        end = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        start = end - timedelta(days=7)
+        label = f'{start:%d %b} - {(end - timedelta(days=1)):%d %b %Y}'
+    elif period == 'month':
+        end = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        start = (end - timedelta(days=1)).replace(day=1)
+        label = f'{start:%B %Y}'
+    else:
+        start = end = None
+        label = 'All time'
+    def in_period(timestamp):
+        if start is None:
+            return True
+        d = datetime.fromisoformat(timestamp).astimezone(LOCAL)
+        return start <= d < end
+    with db_connect() as con:
+        rows = con.execute('SELECT published_at,status,combined_odds FROM doubles WHERE published_at IS NOT NULL').fetchall()
+        scan_rows = con.execute('SELECT scanned_at,status,checked,qualified,candidates FROM scan_runs').fetchall()
+    selected = [(status,odd) for published,status,odd in rows if in_period(published)]
+    wins = sum(status == 'won' for status, _ in selected)
+    losses = sum(status == 'lost' for status, _ in selected)
+    pending = sum(status == 'pending' for status, _ in selected)
+    settled = wins + losses
+    pnl = sum((odd-1 if status == 'won' else -1) for status,odd in selected if status in ('won','lost'))
+    scans = [r for r in scan_rows if in_period(r[0])]
+    statuses = {}
+    for _,state,*_ in scans:
+        statuses[state] = statuses.get(state, 0) + 1
+    avg = sum(odd for _,odd in selected)/len(selected) if selected else 0
+    return (f'📈 OddX2 | {period.upper()} PERFORMANCE\n'
+            f'Period: {label}\n'
+            f'Published doubles: {len(selected)}\n'
+            f'Won: {wins} | Lost: {losses} | Pending: {pending}\n'
+            f'Win rate: {wins/settled:.1%}\n' if settled else
+            f'📈 OddX2 | {period.upper()} PERFORMANCE\n'
+            f'Period: {label}\n'
+            f'Published doubles: {len(selected)}\n'
+            f'Won: {wins} | Lost: {losses} | Pending: {pending}\n'
+            f'Win rate: N/A\n') + (
+            f'Average combined odds: {avg:.2f}\n'
+            f'Theoretical P/L: {pnl:+.2f} units\n'
+            f'ROI: {pnl/settled:+.1%}\n' if settled else
+            f'Average combined odds: {avg:.2f}\nROI: N/A\n') + (
+            f'Scans: {len(scans)}\n'
+            f'Scan outcomes: {statuses}\n'
+            'Published-pick cohort; fixed hypothetical 1-unit stakes. '
+            'Later settlements can update historical period results. '
+            'No proven predictive advantage.')
+
+
+async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await asyncio.to_thread(performance_report, 'week'))
+
+
+async def monthly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await asyncio.to_thread(performance_report, 'month'))
+
+
+async def alltime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await asyncio.to_thread(performance_report, 'all'))
+
+
+async def diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def read():
+        with db_connect() as con:
+            return con.execute('SELECT scanned_at,status,checked,qualified,candidates FROM scan_runs ORDER BY id DESC LIMIT 12').fetchall()
+    rows = await asyncio.to_thread(read)
+    lines = ['🔎 OddX2 | LAST 12 SCANS']
+    for stamp,state,checked,qualified,candidates in rows:
+        d = datetime.fromisoformat(stamp).astimezone(LOCAL)
+        lines.append(f'{d:%d %b %H:%M} | {state} | checked {checked}, sufficient data {qualified}, candidates {candidates}')
+    await update.message.reply_text('\n'.join(lines)[:4000])
+
+
+async def scheduled_reports(app):
+    while True:
+        try:
+            now = datetime.now(LOCAL)
+            if CHANNEL_ID and now.hour >= 9:
+                for kind, due in [('week', now.weekday() == 0), ('month', now.day == 1)]:
+                    if not due:
+                        continue
+                    period_key = ((now - timedelta(days=7)).strftime('%G-W%V') if kind == 'week'
+                                  else (now.replace(day=1) - timedelta(days=1)).strftime('%Y-%m'))
+                    with db_connect() as con:
+                        already = con.execute('SELECT 1 FROM report_posts WHERE period_type=? AND period_key=?',
+                                              (kind,period_key)).fetchone()
+                    if already:
+                        continue
+                    message = await asyncio.to_thread(performance_report,kind)
+                    await app.bot.send_message(chat_id=CHANNEL_ID, text=message)
+                    with db_connect() as con:
+                        con.execute('INSERT OR IGNORE INTO report_posts(period_type,period_key,sent_at) VALUES(?,?,?)',
+                                    (kind,period_key,datetime.now(timezone.utc).isoformat()))
+        except Exception:
+            log.exception('Scheduled report failed')
+        await asyncio.sleep(3600)
+
+
+async def periodic_sport_observations(app):
+    await asyncio.sleep(180)
+    while True:
+        try:
+            await asyncio.to_thread(multi_observations)
+        except Exception:
+            log.exception('Multisport discovery failed')
+        await asyncio.sleep(6*3600)
+
+
 async def periodic_scanning(app):
     # Wait after startup so the first scan is not triggered by each deployment.
     await asyncio.sleep(300)
@@ -680,35 +859,26 @@ async def periodic_settlement(app):
 
 
 async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Channel connection test restricted to channel administrators in a private chat."""
-    if update.effective_chat.type != 'private' or not update.effective_user:
-        return
-    if not CHANNEL_ID:
-        await update.message.reply_text('❌ TELEGRAM_CHANNEL_ID is missing in Railway.')
+    if not CHANNEL_ID or not update.effective_user or update.effective_chat.type != 'private':
         return
     try:
         member = await context.bot.get_chat_member(CHANNEL_ID, update.effective_user.id)
         if member.status not in ('creator', 'administrator'):
-            await update.message.reply_text('⛔ Only OddX2 channel administrators can run this test.')
+            await update.message.reply_text('Only channel administrators can run this test.')
             return
-        await context.bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=('✅ OddX2 is connected successfully.\n\n'
-                  'Automated statistical selections and verified results will appear here.\n'
-                  'Research only. No guaranteed outcomes.')
-        )
-        await update.message.reply_text('✅ Test message delivered to the OddX2 channel.')
+        await context.bot.send_message(chat_id=CHANNEL_ID, text='✅ OddX2 channel connection confirmed. Research only.')
+        await update.message.reply_text('Test delivered to OddX2 channel.')
     except Exception:
-        log.exception('Channel connection test failed')
-        await update.message.reply_text(
-            '❌ Could not post to the channel. Check TELEGRAM_CHANNEL_ID and the bot administrator permission to post messages. '
-            'See Railway logs for details.')
+        log.exception('Channel test failed')
+        await update.message.reply_text('Channel test failed. Check Railway logs.')
 
 
 async def on_startup(app):
     await asyncio.to_thread(db_connect_and_close)
     app.create_task(periodic_settlement(app))
     app.create_task(periodic_scanning(app))
+    app.create_task(scheduled_reports(app))
+    app.create_task(periodic_sport_observations(app))
     app.create_task(publish_updates(app))
 
 
@@ -731,9 +901,11 @@ def main():
                              ('results', verifica), ('verifica', verifica),
                              ('scan', scanare), ('scanare', scanare),
                              ('report', raport), ('raport', raport),
-                             ('testchannel', testchannel)]:
+                             ('weekly', weekly), ('monthly', monthly),
+                             ('alltime', alltime), ('diagnostics', diagnostics),
+                             ('sports', sports)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('OddX2 2.5.1 started')
+    log.info('OddX2 3.0-beta started')
     app.run_polling()
 
 
