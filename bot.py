@@ -23,7 +23,7 @@ DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 2
 SCAN_LIMIT_PER_DAY = 16
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "3.5-beta"
+VERSION = "3.6-beta"
 MIN_LEAD_MINUTES = 15
 DAILY_DOUBLE_TARGET = 10
 MAX_NEW_DOUBLES_PER_SCAN = 3
@@ -248,7 +248,7 @@ def find_double():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🤖 OddX2 3.5-beta online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/weekly - last completed week\n/monthly - last completed month\n/alltime - published track record\n/diagnostics - scan reasons\n/sports - check basketball and hockey feeds\n/basketball - basketball research preview\n/hockey - hockey research preview\n/multiscan - multisport diagnostic research')
+    await update.message.reply_text('🤖 OddX2 3.6-beta online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/weekly - last completed week\n/monthly - last completed month\n/alltime - published track record\n/diagnostics - scan reasons\n/sports - check basketball and hockey feeds\n/basketball - basketball research preview\n/hockey - hockey research preview\n/multiscan - multisport diagnostic research')
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1050,27 +1050,73 @@ async def hockey_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # OddX2 3.5-beta: read-only multisport probability research.
 # No writes to SQLite, no Telegram channel posts, and no asserted bookmaker value.
-def ms_probabilities(sport, home, away, expected_home, expected_away, market, label):
-    """Return exploratory probability only for an explicitly understood model outcome."""
+def ms_probabilities(sport, home, away, expected_home, expected_away, market, label,
+                     model='improved'):
+    """Exploratory probabilities. Historical records must predate the fixture."""
+    if model == 'legacy':
+        return ms_probabilities_legacy(sport, home, away, expected_home,
+                                       expected_away, market, label)
+    if sport == 'basketball':
+        if market != 4:
+            return None
+        match = re.fullmatch(r'(Over|Under)\s+(\d+\.5)', label, re.I)
+        if not match:
+            return None
+        # Variance is estimated from two independent venue-specific histories.
+        # Regularization reduces volatility from samples as small as five.
+        ht = [r[2] + r[3] for r in home]
+        at = [r[2] + r[3] for r in away]
+        if len(ht) < 5 or len(at) < 5:
+            return None
+        def variance(values):
+            mean = sum(values) / len(values)
+            return sum((v - mean)**2 for v in values) / max(1, len(values)-1)
+        empirical = (variance(ht) + variance(at)) / 2
+        # Weak prior, not fitted to historical outcomes.
+        sd = math.sqrt(0.70 * empirical + 0.30 * 22.0**2)
+        sd = max(14.0, min(45.0, sd))
+        z = (float(match.group(2)) - expected_home - expected_away) / sd
+        under = 0.5 * math.erfc(-z / math.sqrt(2))
+        prob = 1 - under if match.group(1).lower() == 'over' else under
+        return max(0.001, min(0.999, prob)), 'full-game total; OT settlement unverified'
+    if sport == 'hockey':
+        if market != 1 or label not in ('Home', 'Draw', 'Away'):
+            return None
+        # Shrink unstable venue averages towards conservative neutral priors.
+        # 3-way outcomes are explicitly settled at 60 minutes.
+        n = min(len(home), len(away))
+        weight = n / (n + 8.0)
+        hlam = max(0.20, min(weight * expected_home + (1-weight)*2.85, 6.0))
+        alam = max(0.20, min(weight * expected_away + (1-weight)*2.65, 6.0))
+        hp = [math.exp(-hlam) * hlam**i / math.factorial(i) for i in range(26)]
+        ap = [math.exp(-alam) * alam**i / math.factorial(i) for i in range(26)]
+        probs = {'Home': 0.0, 'Draw': 0.0, 'Away': 0.0}
+        for i, x in enumerate(hp):
+            for j, y in enumerate(ap):
+                probs['Home' if i > j else 'Away' if i < j else 'Draw'] += x*y
+        norm = sum(probs.values())
+        return probs[label] / norm, '60-minute 3-way; regularized Poisson'
+    return None
+
+
+def ms_probabilities_legacy(sport, home, away, expected_home, expected_away, market, label):
+    """Frozen 3.5 comparator for paired, same-fixture backtests."""
     if sport == 'basketball':
         if market != 4:
             return None
         m = re.fullmatch(r'(Over|Under)\s+(\d+\.5)', label, re.I)
         if not m:
             return None
-        # Empirical volatility of historical game totals; conservative floor.
         totals = [r[2]+r[3] for r in home] + [r[2]+r[3] for r in away]
         if len(totals) < 10:
             return None
         avg = sum(totals)/len(totals)
         sd = math.sqrt(sum((v-avg)**2 for v in totals)/(len(totals)-1))
         sd = max(sd, 15.0)
-        line = float(m.group(2))
-        z = (line - (expected_home+expected_away))/sd
+        z = (float(m.group(2)) - (expected_home+expected_away))/sd
         under = 0.5*(1+math.erf(z/math.sqrt(2)))
-        return (1-under if m.group(1).lower() == 'over' else under), 'full-game total; OT rules unverified'
+        return (1-under if m.group(1).lower() == 'over' else under), 'legacy'
     if sport == 'hockey':
-        # Market 1 is explicitly 3Way Result (regulation), not two-way incl. OT.
         if market != 1 or label not in ('Home','Draw','Away'):
             return None
         hlam = max(0.15,min(expected_home,7.0))
@@ -1081,7 +1127,7 @@ def ms_probabilities(sport, home, away, expected_home, expected_away, market, la
         for i,x in enumerate(hp):
             for j,y in enumerate(ap):
                 probs['Home' if i>j else 'Away' if i<j else 'Draw'] += x*y
-        return probs[label], '60-minute 3-way; Poisson research model'
+        return probs[label], 'legacy'
     return None
 
 
@@ -1234,10 +1280,10 @@ def multiscan_preview():
 
 
 async def multiscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔎 OddX2 3.5 | Running read-only multisport diagnostic scan (48h, up to 60 games per sport)...')
+    await update.message.reply_text('🔎 OddX2 3.6 | Running read-only multisport diagnostic scan (48h, up to 60 games per sport)...')
     try:
         pairs,stats,diag = await asyncio.to_thread(multiscan_preview)
-        lines = ['🧪 OddX2 3.5-beta | MULTISPORT DIAGNOSTICS',
+        lines = ['🧪 OddX2 3.6-beta | MULTISPORT DIAGNOSTICS',
                  'Read-only. Nothing saved or published. Uncalibrated model.']
         for sport,st in stats.items():
             if 'error' in st:
@@ -1276,97 +1322,107 @@ async def multiscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('❌ Multisport scan failed. Check Railway logs.')
 
 
-def ms_rolling_backtest(sport, days=14, max_tests=16):
-    """Read-only, leakage-free rolling test of model probabilities, NOT a betting ROI backtest.
+def ms_rolling_backtest(sport, days=21, max_tests=30):
+    """Paired, read-only rolling evaluation; no historical bookmaker odds.
 
-    Basketball uses a predeclared half-point line derived from pregame historical
-    expected total. Hockey tests 60-minute 3-way outcome. Neither uses historical odds.
+    Compares the same fixtures under 3.5, 3.6 and naive probabilities.
+    Uses only completed games dated before each target fixture for features.
     """
     now = datetime.now(timezone.utc)
     cache, games, seen = {}, [], set()
-    for day_back in range(1, days+1):
+    for day_back in range(1, days + 1):
         date = (now - timedelta(days=day_back)).date().isoformat()
-        for g in multisport_api(sport, 'games', {'date':date}):
-            if g.get('id') in seen or ms_finished_score(sport, g) is None:
+        for game in multisport_api(sport, 'games', {'date': date}):
+            if game.get('id') in seen or ms_finished_score(sport, game) is None:
                 continue
-            seen.add(g['id'])
-            games.append(g)
-    # Recent completed events, deterministic order; no current/future results in training.
-    games.sort(key=lambda g:g.get('date',''), reverse=True)
-    result = {'tested':0, 'eligible':0, 'errors':0, 'brier_sum':0.0,
-              'baseline_brier_sum':0.0, 'correct':0, 'sport':sport}
-    for g in games[:100]:
+            seen.add(game['id'])
+            games.append(game)
+    games.sort(key=lambda g: g.get('date', ''), reverse=True)
+    result = {'tested': 0, 'eligible': 0, 'errors': 0, 'correct': 0,
+              'old_correct': 0, 'new_brier': 0., 'old_brier': 0.,
+              'baseline_brier': 0., 'sport': sport}
+    for game in games[:180]:
         if result['tested'] >= max_tests:
             break
         try:
-            league, teams = g.get('league') or {}, g.get('teams') or {}
+            league, teams = game.get('league') or {}, game.get('teams') or {}
             h, a = teams.get('home') or {}, teams.get('away') or {}
-            if not all((h.get('id'),a.get('id'),league.get('id'),league.get('season') is not None)):
+            if not all((h.get('id'), a.get('id'), league.get('id'),
+                        league.get('season') is not None)):
                 continue
-            when = datetime.fromisoformat(g['date'].replace('Z','+00:00')).astimezone(timezone.utc)
-            home = [r for r in ms_history(sport,h['id'],league['season'],league['id'],when,cache)
-                    if r[1]=='home'][:10]
-            away = [r for r in ms_history(sport,a['id'],league['season'],league['id'],when,cache)
-                    if r[1]=='away'][:10]
-            if len(home)<5 or len(away)<5:
+            when = datetime.fromisoformat(game['date'].replace('Z', '+00:00')).astimezone(timezone.utc)
+            home = [r for r in ms_history(sport, h['id'], league['season'],
+                    league['id'], when, cache) if r[1] == 'home'][:10]
+            away = [r for r in ms_history(sport, a['id'], league['season'],
+                    league['id'], when, cache) if r[1] == 'away'][:10]
+            if len(home) < 5 or len(away) < 5:
                 continue
+            eh = (sum(r[2] for r in home)/len(home) +
+                  sum(r[3] for r in away)/len(away))/2
+            ea = (sum(r[2] for r in away)/len(away) +
+                  sum(r[3] for r in home)/len(home))/2
+            hs, ass = ms_finished_score(sport, game)
             result['eligible'] += 1
-            eh = (sum(r[2] for r in home)/len(home)+sum(r[3] for r in away)/len(away))/2
-            ea = (sum(r[2] for r in away)/len(away)+sum(r[3] for r in home)/len(home))/2
-            hs,as_ = ms_finished_score(sport,g)
-            if sport=='basketball':
-                # A model-derived test threshold, NOT a historical bookmaker line.
-                line = math.floor(eh+ea)+0.5
-                outcome = int(hs+as_ > line)
-                pr = ms_probabilities(sport,home,away,eh,ea,4,f'Over {line:.1f}')
-                if pr is None: continue
-                probability = pr[0]
-                baseline = 0.5
+            if sport == 'basketball':
+                line = math.floor(eh + ea) + 0.5
+                label = f'Over {line:.1f}'
+                outcome = int(hs + ass > line)
+                new = ms_probabilities(sport, home, away, eh, ea, 4, label)
+                old = ms_probabilities(sport, home, away, eh, ea, 4, label, model='legacy')
+                if new is None or old is None:
+                    continue
+                pn, po = new[0], old[0]
+                result['new_brier'] += (pn-outcome)**2
+                result['old_brier'] += (po-outcome)**2
+                result['baseline_brier'] += (0.5-outcome)**2
+                result['correct'] += int((pn >= 0.5) == bool(outcome))
+                result['old_correct'] += int((po >= 0.5) == bool(outcome))
             else:
-                outcome = 'Home' if hs>as_ else 'Away' if hs<as_ else 'Draw'
-                probs = {label:ms_probabilities(sport,home,away,eh,ea,1,label)[0]
-                         for label in ('Home','Draw','Away')}
-                # Multi-class Brier score: sum of squared probability errors.
-                probability = probs[outcome]
-                baseline = 1/3
-            if sport=='basketball':
-                result['brier_sum'] += (probability-outcome)**2
-                result['baseline_brier_sum'] += (baseline-outcome)**2
-                result['correct'] += int((probability>=0.5)==bool(outcome))
-            else:
-                result['brier_sum'] += sum((p-int(k==outcome))**2 for k,p in probs.items())
-                result['baseline_brier_sum'] += 2/3
-                result['correct'] += int(max(probs,key=probs.get)==outcome)
+                outcome = 'Home' if hs > ass else 'Away' if hs < ass else 'Draw'
+                labels = ('Home', 'Draw', 'Away')
+                new = {k: ms_probabilities(sport, home, away, eh, ea, 1, k)[0]
+                       for k in labels}
+                old = {k: ms_probabilities(sport, home, away, eh, ea, 1, k,
+                       model='legacy')[0] for k in labels}
+                result['new_brier'] += sum((p-int(k == outcome))**2 for k, p in new.items())
+                result['old_brier'] += sum((p-int(k == outcome))**2 for k, p in old.items())
+                result['baseline_brier'] += 2/3
+                result['correct'] += int(max(new, key=new.get) == outcome)
+                result['old_correct'] += int(max(old, key=old.get) == outcome)
             result['tested'] += 1
-        except (requests.RequestException, ValueError, KeyError, TypeError, ZeroDivisionError) as exc:
+        except (requests.RequestException, ValueError, KeyError, TypeError,
+                ZeroDivisionError) as exc:
             result['errors'] += 1
-            log.warning('3.5 rolling test skipped %s game %s: %s',sport,g.get('id'),exc)
+            log.warning('3.6 backtest skipped %s game %s: %s', sport, game.get('id'), exc)
     return result
 
 
 async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔬 OddX2 3.5 | Running read-only rolling historical evaluation...')
-    lines = ['🔬 OddX2 3.5-beta | ROLLING MODEL CHECK',
-             'No bookmaker odds or historical betting ROI. No records saved or published.',
-             'Each prediction uses only games finished BEFORE its kickoff.']
-    for sport in ('basketball','hockey'):
+    await update.message.reply_text('🔬 OddX2 3.6 | Running paired rolling model comparison...')
+    lines = ['🔬 OddX2 3.6-beta | MODEL COMPARISON',
+             'Research only. Same historical fixtures for both models.',
+             'No bookmaker odds, betting ROI, saved records or channel posts.']
+    for sport in ('basketball', 'hockey'):
         try:
-            r = await asyncio.to_thread(ms_rolling_backtest,sport)
+            r = await asyncio.to_thread(ms_rolling_backtest, sport)
             n = r['tested']
             if n:
-                lines.append(f'{sport.title()}: {n} historical games tested | '
-                             f'accuracy {r["correct"]/n:.1%} | '
-                             f'model Brier {r["brier_sum"]/n:.3f} | '
-                             f'naive baseline Brier {r["baseline_brier_sum"]/n:.3f} | '
-                             f'errors {r["errors"]}')
+                lines.append(
+                    f'{sport.title()}: {n} games | API errors {r["errors"]}\n'
+                    f'3.6 Brier {r["new_brier"]/n:.3f} | accuracy {r["correct"]/n:.1%}\n'
+                    f'3.5 Brier {r["old_brier"]/n:.3f} | accuracy {r["old_correct"]/n:.1%}\n'
+                    f'Naive baseline Brier {r["baseline_brier"]/n:.3f}'
+                )
             else:
-                lines.append(f'{sport.title()}: insufficient eligible historical games; errors {r["errors"]}.')
+                lines.append(f'{sport.title()}: insufficient historical games; errors {r["errors"]}.')
         except Exception as exc:
-            log.exception('3.5 backtest failed for %s',sport)
+            log.exception('3.6 backtest failed for %s', sport)
             lines.append(f'{sport.title()}: unavailable ({type(exc).__name__}).')
-    lines.append('Basketball: over/under a MODEL-DERIVED threshold (not historical market odds). '
-                 'Hockey: 60-minute 3-way result. Tiny samples are not calibration or proof of advantage.')
+    lines.append('Lower Brier is better. Basketball uses a model-derived total line, '
+                 'not historical market odds. Hockey uses 60-minute 3-way results. '
+                 'Small samples cannot establish predictive advantage.')
     await update.message.reply_text('\n\n'.join(lines)[:4000])
+
 
 
 def main():
@@ -1387,7 +1443,7 @@ def main():
                              ('alltime', alltime), ('diagnostics', diagnostics),
                              ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview), ('multiscan', multiscan_command), ('backtest', backtest_command)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('OddX2 3.5-beta started')
+    log.info('OddX2 3.6-beta started')
     app.run_polling()
 
 
