@@ -22,6 +22,8 @@ LOCAL = ZoneInfo('Europe/Bucharest')
 DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 4
 SCAN_LIMIT_PER_DAY = 8
+CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
+VERSION = "2.5"
 
 
 def api(path, params):
@@ -225,11 +227,11 @@ def find_double():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🤖 Odds Copilot 2.4 online!\n/status - status\n/meciuri - upcoming fixtures\n/cote - sample odds\n/dubla - mathematical 1X2 test\n/analiza - Poisson model\n/istoric - saved doubles\n/statistici - ROI and results\n/verifica - refresh final scores')
+    await update.message.reply_text('🤖 OddX2 2.5 online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report')
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('✅ Odds Copilot 2.4 funcționează.')
+    await update.message.reply_text('✅ OddX2 2.5 is online.')
 
 
 async def meciuri(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -316,6 +318,13 @@ def db_connect():
         candidates INTEGER NOT NULL DEFAULT 0,
         detail TEXT NOT NULL DEFAULT ''
     )''')
+    # Add publication state without resetting historical research data.
+    for column in ('published_at', 'result_posted_at'):
+        try:
+            con.execute(f'ALTER TABLE doubles ADD COLUMN {column} TEXT')
+        except sqlite3.OperationalError as exc:
+            if 'duplicate column name' not in str(exc).lower():
+                raise
     con.commit()
     return con
 
@@ -352,6 +361,91 @@ def save_double(best):
                 c['threshold'], c['odd'], c['estimated'],
             ))
     return True
+
+
+def get_unpublished():
+    with db_connect() as con:
+        rows = con.execute("""SELECT id,bookmaker,combined_odds,created_at FROM doubles
+                              WHERE published_at IS NULL ORDER BY id""").fetchall()
+        output = []
+        now = datetime.now(timezone.utc)
+        for id_, book, total, created in rows:
+            legs = con.execute("""SELECT kickoff,home,away,market,selection,odd,estimated
+                                  FROM legs WHERE double_id=? ORDER BY id""", (id_,)).fetchall()
+            # Skip historic doubles and games already underway. No retroactive picks.
+            if (len(legs) != 2 or (now - datetime.fromisoformat(created).astimezone(timezone.utc)).total_seconds() > 900
+                    or any(datetime.fromisoformat(l[0]).astimezone(timezone.utc) <= now for l in legs)):
+                continue
+            output.append((id_, book, total, legs))
+        return output
+
+
+def get_unposted_results():
+    with db_connect() as con:
+        return con.execute("""SELECT id,status,combined_odds FROM doubles
+                              WHERE published_at IS NOT NULL AND result_posted_at IS NULL
+                              AND status IN ('won','lost') ORDER BY id""").fetchall()
+
+
+def mark_posted(id_, field):
+    if field not in ('published_at', 'result_posted_at'):
+        raise ValueError('Invalid publication column')
+    with db_connect() as con:
+        con.execute(f'UPDATE doubles SET {field}=? WHERE id=? AND {field} IS NULL',
+                    (datetime.now(timezone.utc).isoformat(), id_))
+
+
+async def publish_updates(app):
+    if not CHANNEL_ID:
+        log.warning('Missing TELEGRAM_CHANNEL_ID; channel publishing disabled')
+        return
+    for id_, book, total, legs in await asyncio.to_thread(get_unpublished):
+        lines = [f'📊 OddX2 | DOUBLE #{id_}', 'Experimental pre-match research', '']
+        for i, (kick, home, away, market, selection, odd, estimated) in enumerate(legs, 1):
+            kickoff = datetime.fromisoformat(kick).astimezone(LOCAL)
+            lines.extend([f'{i}. {home} vs {away}',
+                          f'Kickoff: {kickoff:%d %b %Y, %H:%M} (Bucharest)',
+                          f'{market}: {selection} @ {odd:.2f}',
+                          f'Experimental model estimate: {estimated:.1%}', ''])
+        lines.extend([f'Bookmaker: {book}', f'Combined odds: {total:.2f}',
+                      '⚠️ Uncalibrated estimates. Odds may change. No guaranteed returns.'])
+        await app.bot.send_message(chat_id=CHANNEL_ID, text='\n'.join(lines))
+        await asyncio.to_thread(mark_posted, id_, 'published_at')
+        log.info('Published double #%s', id_)
+    for id_, state, odds in await asyncio.to_thread(get_unposted_results):
+        message = (f'🏁 OddX2 | DOUBLE #{id_} RESULT\n'
+                   f'Outcome: {state.upper()}\nCombined odds: {odds:.2f}\n'
+                   'Hypothetical tracking only; no actual bets placed.')
+        await app.bot.send_message(chat_id=CHANNEL_ID, text=message)
+        await asyncio.to_thread(mark_posted, id_, 'result_posted_at')
+        log.info('Published result #%s', id_)
+
+
+def daily_summary():
+    with db_connect() as con:
+        rows = con.execute("""SELECT status,combined_odds FROM doubles
+                              WHERE published_at IS NOT NULL""").fetchall()
+    wins = sum(state == 'won' for state, _ in rows)
+    losses = sum(state == 'lost' for state, _ in rows)
+    pending = sum(state == 'pending' for state, _ in rows)
+    settled = wins + losses
+    pnl = sum((odd - 1 if state == 'won' else -1)
+              for state, odd in rows if state in ('won', 'lost'))
+    return (f'📈 OddX2 | TRACK RECORD\nPublished doubles: {len(rows)}\n'
+            f'Won: {wins} | Lost: {losses} | Pending: {pending}\n'
+            + (f'Theoretical P/L: {pnl:+.2f} units | ROI: {pnl / settled:+.1%}'
+               if settled else 'ROI: not available yet')
+            + '\nBased on hypothetical 1-unit stakes. Not real betting returns.')
+
+
+async def publish_results_and_summary(app):
+    if not CHANNEL_ID:
+        return
+    outstanding = await asyncio.to_thread(get_unposted_results)
+    if outstanding:
+        await publish_updates(app)
+        await app.bot.send_message(chat_id=CHANNEL_ID,
+                                   text=await asyncio.to_thread(daily_summary))
 
 
 def settle_pending():
@@ -405,7 +499,7 @@ def settle_pending():
 
 
 async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔎 Odds Copilot 2.4 — Running Poisson model...')
+    await update.message.reply_text('🔎 OddX2 2.5 — Running statistical analysis...')
     try:
         best, checked, qualified, count = await asyncio.to_thread(analyze)
         if not best:
@@ -416,7 +510,7 @@ async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         saved = await asyncio.to_thread(save_double, best)
         x, y, total = best
-        lines = ['🧪 Odds Copilot 2.4 — Poisson model', 'Experimental statistical analysis', '']
+        lines = ['🧪 OddX2 2.5 — Poisson model', 'Experimental statistical analysis', '']
         for i, c in enumerate((x, y), 1):
             lines.extend([
                 f"{i}. {c['home']} vs {c['away']} — {c['kick'].astimezone(LOCAL):%H:%M}",
@@ -429,8 +523,10 @@ async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.extend([
             f'🎯 Combined odds: {total:.2f}',
             '💾 Saved to history.' if saved else '💾 Already saved (duplicate selection).',
-            '⚠️ Experimental and uncalibrated. Not proven betting value. No automatic publishing.',
+            '⚠️ Experimental and uncalibrated. Not proven betting value.',
         ])
+        if saved:
+            await publish_updates(context.application)
         await update.message.reply_text('\n'.join(lines))
     except Exception:
         log.exception('Poisson analysis failed')
@@ -487,14 +583,15 @@ async def statistici(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def verifica(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         updated = await asyncio.to_thread(settle_pending)
-        await update.message.reply_text(f'🔄 Updated {updated} settled selections. Use /statistici.')
+        await publish_results_and_summary(context.application)
+        await update.message.reply_text(f'🔄 Updated {updated} settled selections. Use /stats.')
     except Exception:
         log.exception('Settlement failed')
         await update.message.reply_text('❌ Settlement error. Check Railway logs.')
 
 
 def automated_scan():
-    """Run a bounded research scan, without posting or betting."""
+    """Run a bounded research scan; publication is handled separately."""
     now = datetime.now(timezone.utc)
     local_day = now.astimezone(LOCAL).date().isoformat()
     with db_connect() as con:
@@ -509,7 +606,7 @@ def automated_scan():
             state = 'saved' if saved else 'duplicate_or_reused_fixture'
         else:
             state = 'no_qualifying_double'
-        detail = 'research only; no automatic publication'
+        detail = 'experimental research; eligible new doubles published to channel'
     except Exception as exc:
         log.exception('Automated scan failed')
         state, checked, qualified, candidates = 'error', 0, 0, 0
@@ -524,7 +621,8 @@ async def scanare(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('🔎 Running one research scan...')
     try:
         state = await asyncio.to_thread(automated_scan)
-        await update.message.reply_text(f'🧪 Scan: {state}. Use /istoric and /raport. No picks published.')
+        await publish_updates(context.application)
+        await update.message.reply_text(f'🧪 Scan: {state}. Check OddX2 channel, /history and /report.')
     except Exception:
         log.exception('Manual scan failed')
         await update.message.reply_text('❌ Scan failed; check Railway logs.')
@@ -565,6 +663,7 @@ async def periodic_scanning(app):
         try:
             state = await asyncio.to_thread(automated_scan)
             log.info('Automated research scan: %s', state)
+            await publish_updates(app)
         except Exception:
             log.exception('Research scan failed')
         await asyncio.sleep(AUTO_SCAN_HOURS * 3600)
@@ -575,6 +674,7 @@ async def periodic_settlement(app):
         await asyncio.sleep(1800)
         try:
             await asyncio.to_thread(settle_pending)
+            await publish_results_and_summary(app)
         except Exception:
             log.exception('Background settlement failed')
 
@@ -583,6 +683,7 @@ async def on_startup(app):
     await asyncio.to_thread(db_connect_and_close)
     app.create_task(periodic_settlement(app))
     app.create_task(periodic_scanning(app))
+    app.create_task(publish_updates(app))
 
 
 def db_connect_and_close():
@@ -594,14 +695,21 @@ def main():
     if not TOKEN or not KEY:
         raise RuntimeError('Missing TELEGRAM_BOT_TOKEN or API_FOOTBALL_KEY in Railway')
     app = Application.builder().token(TOKEN).post_init(on_startup).build()
-    for command, handler in [('start', start), ('status', status), ('meciuri', meciuri),
-                             ('cote', cote), ('dubla', dubla), ('analiza', analiza),
-                             ('istoric', istoric), ('statistici', statistici), ('verifica', verifica),
-                             ('scanare', scanare), ('raport', raport)]:
+    for command, handler in [('start', start), ('status', status),
+                             ('fixtures', meciuri), ('meciuri', meciuri),
+                             ('odds', cote), ('cote', cote),
+                             ('double', dubla), ('dubla', dubla),
+                             ('analyze', analiza), ('analiza', analiza),
+                             ('history', istoric), ('istoric', istoric),
+                             ('stats', statistici), ('statistici', statistici),
+                             ('results', verifica), ('verifica', verifica),
+                             ('scan', scanare), ('scanare', scanare),
+                             ('report', raport), ('raport', raport)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('Odds Copilot 2.4 started')
+    log.info('OddX2 2.5 started')
     app.run_polling()
 
 
 if __name__ == '__main__':
     main()
+
