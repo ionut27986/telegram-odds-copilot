@@ -23,7 +23,7 @@ DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 2
 SCAN_LIMIT_PER_DAY = 16
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "3.6-beta"
+VERSION = "3.7-beta"
 MIN_LEAD_MINUTES = 15
 DAILY_DOUBLE_TARGET = 10
 MAX_NEW_DOUBLES_PER_SCAN = 3
@@ -1322,7 +1322,7 @@ async def multiscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('❌ Multisport scan failed. Check Railway logs.')
 
 
-def ms_rolling_backtest(sport, days=21, max_tests=30):
+def ms_rolling_backtest(sport, days=45, max_tests=75):
     """Paired, read-only rolling evaluation; no historical bookmaker odds.
 
     Compares the same fixtures under 3.5, 3.6 and naive probabilities.
@@ -1340,8 +1340,9 @@ def ms_rolling_backtest(sport, days=21, max_tests=30):
     games.sort(key=lambda g: g.get('date', ''), reverse=True)
     result = {'tested': 0, 'eligible': 0, 'errors': 0, 'correct': 0,
               'old_correct': 0, 'new_brier': 0., 'old_brier': 0.,
-              'baseline_brier': 0., 'sport': sport}
-    for game in games[:180]:
+              'baseline_brier': 0., 'sport': sport, 'leagues': {}, 'days': days, 'scanned': 0}
+    for game in games[:450]:
+        result['scanned'] += 1
         if result['tested'] >= max_tests:
             break
         try:
@@ -1390,6 +1391,15 @@ def ms_rolling_backtest(sport, days=21, max_tests=30):
                 result['correct'] += int(max(new, key=new.get) == outcome)
                 result['old_correct'] += int(max(old, key=old.get) == outcome)
             result['tested'] += 1
+            league_key = f'{league.get("name", "Unknown")} ({league.get("id")})'
+            record = result['leagues'].setdefault(league_key, {'n': 0, 'new': 0., 'old': 0.})
+            record['n'] += 1
+            if sport == 'basketball':
+                record['new'] += (pn-outcome)**2
+                record['old'] += (po-outcome)**2
+            else:
+                record['new'] += sum((v-int(k == outcome))**2 for k, v in new.items())
+                record['old'] += sum((v-int(k == outcome))**2 for k, v in old.items())
         except (requests.RequestException, ValueError, KeyError, TypeError,
                 ZeroDivisionError) as exc:
             result['errors'] += 1
@@ -1398,31 +1408,70 @@ def ms_rolling_backtest(sport, days=21, max_tests=30):
 
 
 async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔬 OddX2 3.6 | Running paired rolling model comparison...')
-    lines = ['🔬 OddX2 3.6-beta | MODEL COMPARISON',
-             'Research only. Same historical fixtures for both models.',
-             'No bookmaker odds, betting ROI, saved records or channel posts.']
+    await update.message.reply_text('🔬 OddX2 3.7 | Running extended historical validation (up to 45 days)...')
+    lines = ['🔬 OddX2 3.7-beta | EXTENDED VALIDATION',
+             'Read-only. Same historical fixtures for 3.5 and 3.6 models.',
+             'No historical bookmaker prices, betting ROI, or saved records.']
     for sport in ('basketball', 'hockey'):
         try:
             r = await asyncio.to_thread(ms_rolling_backtest, sport)
             n = r['tested']
             if n:
                 lines.append(
-                    f'{sport.title()}: {n} games | API errors {r["errors"]}\n'
+                    f'{sport.title()}: {n} eligible games | {r["scanned"]} examined | '
+                    f'API errors {r["errors"]}\n'
                     f'3.6 Brier {r["new_brier"]/n:.3f} | accuracy {r["correct"]/n:.1%}\n'
                     f'3.5 Brier {r["old_brier"]/n:.3f} | accuracy {r["old_correct"]/n:.1%}\n'
                     f'Naive baseline Brier {r["baseline_brier"]/n:.3f}'
                 )
+                ranked = sorted(r['leagues'].items(), key=lambda kv: kv[1]['n'], reverse=True)
+                league_lines = [f'{name}: {v["n"]} games | 3.6 Brier {v["new"]/v["n"]:.3f} '
+                                f'vs 3.5 {v["old"]/v["n"]:.3f}'
+                                for name, v in ranked[:5]]
+                if league_lines:
+                    lines.append(f'{sport.title()} league breakdown (largest samples):\n' +
+                                 '\n'.join(league_lines))
             else:
-                lines.append(f'{sport.title()}: insufficient historical games; errors {r["errors"]}.')
+                lines.append(f'{sport.title()}: insufficient eligible games; errors {r["errors"]}.')
         except Exception as exc:
-            log.exception('3.6 backtest failed for %s', sport)
+            log.exception('3.7 validation failed for %s', sport)
             lines.append(f'{sport.title()}: unavailable ({type(exc).__name__}).')
-    lines.append('Lower Brier is better. Basketball uses a model-derived total line, '
-                 'not historical market odds. Hockey uses 60-minute 3-way results. '
-                 'Small samples cannot establish predictive advantage.')
-    await update.message.reply_text('\n\n'.join(lines)[:4000])
+    lines.append('Lower Brier is better. Basketball threshold is model-derived, NOT '
+                 'a historical bookmaker line. Hockey: regulation-time 3-way. '
+                 'Results are exploratory; sample selection and coverage may bias comparisons.')
+    message = '\n\n'.join(lines)
+    for i in range(0, len(message), 3900):
+        await update.message.reply_text(message[i:i+3900])
 
+
+async def marketcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inspect current quoted lines without storing them as historical odds."""
+    await update.message.reply_text('📊 OddX2 3.7 | Checking currently offered multisport lines...')
+    lines = ['📊 OddX2 3.7-beta | LIVE LINE AUDIT',
+             'Research only. These are current quotes, NOT historical pre-match prices.']
+    for sport in ('basketball', 'hockey'):
+        try:
+            candidates, stat = await asyncio.to_thread(ms_collect_candidates, sport)
+            events = {}
+            for c in candidates:
+                key = c['fixture']
+                if key not in events or c['difference'] > events[key]['difference']:
+                    events[key] = c
+            lines.append(f'{sport.title()}: {stat["inspected"]} games checked, '
+                         f'{stat["priced"]} priced, {stat["unique_events_passed"]} '
+                         f'events passing experimental filter; API errors {stat["errors"]}.')
+            for c in sorted(events.values(), key=lambda v: v['difference'], reverse=True)[:4]:
+                lines.append(f'{c["home"]} vs {c["away"]} | {c["bookmaker"]} | '
+                             f'{c["selection"]} @ {c["odd"]:.2f} | '
+                             f'model {c["estimated"]:.1%} | gap {c["difference"]:+.1%}')
+        except Exception as exc:
+            log.exception('3.7 live line audit failed: %s', sport)
+            lines.append(f'{sport.title()}: unavailable ({type(exc).__name__}).')
+    lines.append('Uncalibrated probabilities. Basketball overtime rules remain unverified. '
+                 'No odds history, ROI, bets, or channel posts created.')
+    message = '\n\n'.join(lines)
+    for i in range(0, len(message), 3900):
+        await update.message.reply_text(message[i:i+3900])
 
 
 def main():
@@ -1441,9 +1490,9 @@ def main():
                              ('report', raport), ('raport', raport),
                              ('weekly', weekly), ('monthly', monthly),
                              ('alltime', alltime), ('diagnostics', diagnostics),
-                             ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview), ('multiscan', multiscan_command), ('backtest', backtest_command)]:
+                             ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview), ('multiscan', multiscan_command), ('backtest', backtest_command), ('marketcheck', marketcheck_command)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('OddX2 3.6-beta started')
+    log.info('OddX2 3.7-beta started')
     app.run_polling()
 
 
