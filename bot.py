@@ -23,7 +23,10 @@ DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 2
 SCAN_LIMIT_PER_DAY = 16
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "3.0-beta"
+VERSION = "3.1-beta"
+MIN_LEAD_MINUTES = 15
+DAILY_DOUBLE_TARGET = 10
+MAX_NEW_DOUBLES_PER_SCAN = 3
 
 
 def api(path, params):
@@ -116,11 +119,13 @@ def goal_probability(market, home_lambda, away_lambda):
     return yes if positive else 1 - yes
 
 
-def analyze():
-    """Experimental Poisson estimates; not calibrated betting predictions."""
+def analyze_batch(max_doubles=3):
+    """Rank multiple independent experimental football doubles."""
     cache, choices = {}, []
     inspected, qualified = 0, 0
-    for kick, game in fixtures(20)[:32]:
+    for kick, game in fixtures(20)[:45]:
+        if kick <= datetime.now(timezone.utc) + timedelta(minutes=MIN_LEAD_MINUTES + 2):
+            continue
         teams = game.get('teams', {})
         h, a = teams.get('home', {}), teams.get('away', {})
         if not h.get('id') or not a.get('id'):
@@ -180,7 +185,7 @@ def analyze():
     with db_connect() as con:
         used = {r[0] for r in con.execute('SELECT fixture_id FROM legs')}
     choices = [c for c in choices if c['fixture'] not in used]
-    best, best_score = None, float('-inf')
+    ranked = []
     for x, y in combinations(choices, 2):
         if x['fixture'] == y['fixture'] or x['bookmaker'] != y['bookmaker']:
             continue
@@ -188,9 +193,22 @@ def analyze():
         if not 1.90 <= combined <= 2.10:
             continue
         score = x['difference'] + y['difference'] - 0.1 * abs(combined - 2)
-        if score > best_score:
-            best, best_score = (x, y, combined), score
-    return best, inspected, qualified, len(choices)
+        ranked.append((score, x, y, combined))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    selected, reserved = [], set()
+    for _, x, y, combined in ranked:
+        if x['fixture'] in reserved or y['fixture'] in reserved:
+            continue
+        selected.append((x, y, combined))
+        reserved.update((x['fixture'], y['fixture']))
+        if len(selected) >= max_doubles:
+            break
+    return selected, inspected, qualified, len(choices)
+
+
+def analyze():
+    doubles, inspected, qualified, count = analyze_batch(1)
+    return (doubles[0] if doubles else None), inspected, qualified, count
 
 
 def find_double():
@@ -230,11 +248,11 @@ def find_double():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🤖 OddX2 3.0-beta online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/weekly - last completed week\n/monthly - last completed month\n/alltime - published track record\n/diagnostics - scan reasons\n/sports - check basketball and hockey feeds')
+    await update.message.reply_text('🤖 OddX2 3.1-beta online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/weekly - last completed week\n/monthly - last completed month\n/alltime - published track record\n/diagnostics - scan reasons\n/sports - check basketball and hockey feeds')
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('✅ OddX2 3.0-beta is online.')
+    await update.message.reply_text('✅ OddX2 3.1-beta is online.')
 
 
 async def meciuri(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -384,7 +402,7 @@ def get_unpublished():
                                   FROM legs WHERE double_id=? ORDER BY id""", (id_,)).fetchall()
             # Skip historic doubles and games already underway. No retroactive picks.
             if (len(legs) != 2 or (now - datetime.fromisoformat(created).astimezone(timezone.utc)).total_seconds() > 900
-                    or any(datetime.fromisoformat(l[0]).astimezone(timezone.utc) <= now for l in legs)):
+                    or any(datetime.fromisoformat(l[0]).astimezone(timezone.utc) <= now + timedelta(minutes=MIN_LEAD_MINUTES) for l in legs)):
                 continue
             output.append((id_, book, total, legs))
         return output
@@ -508,7 +526,7 @@ def settle_pending():
 
 
 async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔎 OddX2 3.0 — Running statistical analysis...')
+    await update.message.reply_text('🔎 OddX2 3.1 — Running statistical analysis...')
     try:
         best, checked, qualified, count = await asyncio.to_thread(analyze)
         if not best:
@@ -519,7 +537,7 @@ async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         saved = await asyncio.to_thread(save_double, best)
         x, y, total = best
-        lines = ['🧪 OddX2 3.0 — Poisson model', 'Experimental statistical analysis', '']
+        lines = ['🧪 OddX2 3.1 — Poisson model', 'Experimental statistical analysis', '']
         for i, c in enumerate((x, y), 1):
             lines.extend([
                 f"{i}. {c['home']} vs {c['away']} — {c['kick'].astimezone(LOCAL):%H:%M}",
@@ -600,26 +618,30 @@ async def verifica(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def automated_scan():
-    """Run a bounded research scan; publication is handled separately."""
+    """Find and store several non-overlapping qualifying doubles per scan."""
     now = datetime.now(timezone.utc)
-    local_day = now.astimezone(LOCAL).date().isoformat()
+    local_day = now.astimezone(LOCAL).date()
     with db_connect() as con:
-        rows = con.execute('SELECT scanned_at FROM scan_runs ORDER BY id DESC LIMIT 40').fetchall()
-    today_count = sum(datetime.fromisoformat(t).astimezone(LOCAL).date().isoformat() == local_day for (t,) in rows)
+        rows = con.execute('SELECT scanned_at FROM scan_runs ORDER BY id DESC LIMIT 100').fetchall()
+        today_saved = con.execute('SELECT created_at FROM doubles').fetchall()
+    today_count = sum(datetime.fromisoformat(t).astimezone(LOCAL).date() == local_day for (t,) in rows)
+    saved_today = sum(datetime.fromisoformat(t).astimezone(LOCAL).date() == local_day for (t,) in today_saved)
     if today_count >= SCAN_LIMIT_PER_DAY:
-        return 'daily limit reached'
+        return 'daily_scan_limit_reached'
+    remaining = max(0, DAILY_DOUBLE_TARGET - saved_today)
+    if remaining == 0:
+        return 'daily_double_target_reached'
     try:
-        best, checked, qualified, candidates = analyze()
-        if best:
-            saved = save_double(best)
-            state = 'saved' if saved else 'duplicate_or_reused_fixture'
-        else:
-            state = 'no_qualifying_double'
-        detail = 'experimental research; eligible new doubles published to channel'
+        doubles, checked, qualified, candidates = analyze_batch(
+            min(MAX_NEW_DOUBLES_PER_SCAN, remaining))
+        saved_count = sum(save_double(double) for double in doubles)
+        state = f'saved_{saved_count}' if saved_count else 'no_new_qualifying_double'
+        detail = (f'proposed={len(doubles)} saved={saved_count}; '
+                  f'min_lead={MIN_LEAD_MINUTES}m; football research only')
     except Exception as exc:
         log.exception('Automated scan failed')
         state, checked, qualified, candidates = 'error', 0, 0, 0
-        detail = str(exc)[:250]
+        detail = f'{type(exc).__name__}: {str(exc)[:160]}'
     with db_connect() as con:
         con.execute('INSERT INTO scan_runs(scanned_at,status,checked,qualified,candidates,detail) VALUES(?,?,?,?,?,?)',
                     (now.isoformat(), state, checked, qualified, candidates, detail))
@@ -905,7 +927,7 @@ def main():
                              ('alltime', alltime), ('diagnostics', diagnostics),
                              ('sports', sports)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('OddX2 3.0-beta started')
+    log.info('OddX2 3.1-beta started')
     app.run_polling()
 
 
