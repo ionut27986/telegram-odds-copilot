@@ -23,7 +23,7 @@ DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 4
 SCAN_LIMIT_PER_DAY = 8
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "2.5"
+VERSION = "2.5.1"
 
 
 def api(path, params):
@@ -227,11 +227,11 @@ def find_double():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🤖 OddX2 2.5 online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report')
+    await update.message.reply_text('🤖 OddX2 2.5.1 online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/testchannel - channel connection test (admins only)')
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('✅ OddX2 2.5 is online.')
+    await update.message.reply_text('✅ OddX2 2.5.1 is online.')
 
 
 async def meciuri(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -679,6 +679,32 @@ async def periodic_settlement(app):
             log.exception('Background settlement failed')
 
 
+async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Channel connection test restricted to channel administrators in a private chat."""
+    if update.effective_chat.type != 'private' or not update.effective_user:
+        return
+    if not CHANNEL_ID:
+        await update.message.reply_text('❌ TELEGRAM_CHANNEL_ID is missing in Railway.')
+        return
+    try:
+        member = await context.bot.get_chat_member(CHANNEL_ID, update.effective_user.id)
+        if member.status not in ('creator', 'administrator'):
+            await update.message.reply_text('⛔ Only OddX2 channel administrators can run this test.')
+            return
+        await context.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=('✅ OddX2 is connected successfully.\n\n'
+                  'Automated statistical selections and verified results will appear here.\n'
+                  'Research only. No guaranteed outcomes.')
+        )
+        await update.message.reply_text('✅ Test message delivered to the OddX2 channel.')
+    except Exception:
+        log.exception('Channel connection test failed')
+        await update.message.reply_text(
+            '❌ Could not post to the channel. Check TELEGRAM_CHANNEL_ID and the bot administrator permission to post messages. '
+            'See Railway logs for details.')
+
+
 async def on_startup(app):
     await asyncio.to_thread(db_connect_and_close)
     app.create_task(periodic_settlement(app))
@@ -704,12 +730,12 @@ def main():
                              ('stats', statistici), ('statistici', statistici),
                              ('results', verifica), ('verifica', verifica),
                              ('scan', scanare), ('scanare', scanare),
-                             ('report', raport), ('raport', raport)]:
+                             ('report', raport), ('raport', raport),
+                             ('testchannel', testchannel)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('OddX2 2.5 started')
+    log.info('OddX2 2.5.1 started')
     app.run_polling()
 
 
 if __name__ == '__main__':
     main()
-
