@@ -23,7 +23,7 @@ DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 2
 SCAN_LIMIT_PER_DAY = 16
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "3.2-preview"
+VERSION = "3.3-beta"
 MIN_LEAD_MINUTES = 15
 DAILY_DOUBLE_TARGET = 10
 MAX_NEW_DOUBLES_PER_SCAN = 3
@@ -248,11 +248,11 @@ def find_double():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🤖 OddX2 3.2-preview online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/weekly - last completed week\n/monthly - last completed month\n/alltime - published track record\n/diagnostics - scan reasons\n/sports - check basketball and hockey feeds\n/basketball - basketball research preview\n/hockey - hockey research preview')
+    await update.message.reply_text('🤖 OddX2 3.3-beta online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/weekly - last completed week\n/monthly - last completed month\n/alltime - published track record\n/diagnostics - scan reasons\n/sports - check basketball and hockey feeds\n/basketball - basketball research preview\n/hockey - hockey research preview\n/multiscan - multisport double research')
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('✅ OddX2 3.2-preview is online.')
+    await update.message.reply_text('✅ OddX2 3.3-beta is online.')
 
 
 async def meciuri(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1047,6 +1047,164 @@ async def basketball_preview(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def hockey_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ms_command(update, context, 'hockey')
 
+
+# OddX2 3.3-beta: read-only multisport probability research.
+# No writes to SQLite, no Telegram channel posts, and no asserted bookmaker value.
+def ms_probabilities(sport, home, away, expected_home, expected_away, market, label):
+    """Return exploratory probability only for an explicitly understood model outcome."""
+    if sport == 'basketball':
+        if market != 4:
+            return None
+        m = re.fullmatch(r'(Over|Under)\s+(\d+\.5)', label, re.I)
+        if not m:
+            return None
+        # Empirical volatility of historical game totals; conservative floor.
+        totals = [r[2]+r[3] for r in home] + [r[2]+r[3] for r in away]
+        if len(totals) < 10:
+            return None
+        avg = sum(totals)/len(totals)
+        sd = math.sqrt(sum((v-avg)**2 for v in totals)/(len(totals)-1))
+        sd = max(sd, 15.0)
+        line = float(m.group(2))
+        z = (line - (expected_home+expected_away))/sd
+        under = 0.5*(1+math.erf(z/math.sqrt(2)))
+        return (1-under if m.group(1).lower() == 'over' else under), 'full-game total; OT rules unverified'
+    if sport == 'hockey':
+        # Market 1 is explicitly 3Way Result (regulation), not two-way incl. OT.
+        if market != 1 or label not in ('Home','Draw','Away'):
+            return None
+        hlam = max(0.15,min(expected_home,7.0))
+        alam = max(0.15,min(expected_away,7.0))
+        hp = [math.exp(-hlam)*hlam**i/math.factorial(i) for i in range(20)]
+        ap = [math.exp(-alam)*alam**i/math.factorial(i) for i in range(20)]
+        probs = {'Home':0.0,'Draw':0.0,'Away':0.0}
+        for i,x in enumerate(hp):
+            for j,y in enumerate(ap):
+                probs['Home' if i>j else 'Away' if i<j else 'Draw'] += x*y
+        return probs[label], '60-minute 3-way; Poisson research model'
+    return None
+
+
+def ms_collect_candidates(sport, now, horizon_hours=20, max_games=24):
+    end = now + timedelta(hours=horizon_hours)
+    games = []
+    for day in sorted({now.date().isoformat(), end.date().isoformat()}):
+        games.extend(multisport_api(sport, 'games', {'date':day}))
+    upcoming = []
+    for g in games:
+        try:
+            when = datetime.fromisoformat(g['date'].replace('Z','+00:00')).astimezone(timezone.utc)
+            if now + timedelta(minutes=20) < when <= end:
+                upcoming.append((when,g))
+        except (ValueError,KeyError,TypeError):
+            continue
+    upcoming.sort(key=lambda item:item[0])
+    cache, candidates = {}, []
+    stats = {'inspected':0,'history':0,'priced':0,'errors':0}
+    for when,g in upcoming[:max_games]:
+        league, teams = g.get('league') or {}, g.get('teams') or {}
+        h, a = teams.get('home') or {}, teams.get('away') or {}
+        if not all((g.get('id'),h.get('id'),a.get('id'),league.get('id'),league.get('season') is not None)):
+            continue
+        stats['inspected'] += 1
+        try:
+            home = [r for r in ms_history(sport,h['id'],league['season'],league['id'],when,cache) if r[1]=='home'][:10]
+            away = [r for r in ms_history(sport,a['id'],league['season'],league['id'],when,cache) if r[1]=='away'][:10]
+            if len(home)<5 or len(away)<5:
+                continue
+            stats['history'] += 1
+            eh = (sum(r[2] for r in home)/len(home)+sum(r[3] for r in away)/len(away))/2
+            ea = (sum(r[2] for r in away)/len(away)+sum(r[3] for r in home)/len(home))/2
+            odds = multisport_api(sport,'odds',{'game':g['id']})
+            if odds: stats['priced'] += 1
+            for entry in odds:
+                for book in entry.get('bookmakers',[]):
+                    for bet in book.get('bets',[]):
+                        for v in bet.get('values',[]):
+                            label = str(v.get('value','')).strip()
+                            result = ms_probabilities(sport,home,away,eh,ea,bet.get('id'),label)
+                            if result is None: continue
+                            try: odd = float(v.get('odd'))
+                            except (ValueError,TypeError): continue
+                            if not math.isfinite(odd) or not 1.25<=odd<=1.85: continue
+                            prob, rule = result
+                            edge = prob - 1/odd
+                            if not math.isfinite(edge) or edge < 0.05: continue
+                            candidates.append({'sport':sport,'fixture':g['id'],'kick':when,
+                                'home':h.get('name','?'),'away':a.get('name','?'),
+                                'bookmaker':book.get('name','?'),'market':bet.get('name','?'),
+                                'selection':label,'odd':odd,'estimated':prob,'difference':edge,
+                                'sample':f'{len(home)}H/{len(away)}A','rule':rule})
+        except (requests.RequestException,ValueError,KeyError,TypeError) as exc:
+            stats['errors'] += 1
+            log.warning('3.3 %s skipped game %s: %s',sport,g.get('id'),exc)
+    return candidates, stats
+
+
+def multiscan_preview():
+    now = datetime.now(timezone.utc)
+    all_candidates, stats = [], {}
+    for sport in ('basketball','hockey'):
+        try:
+            rows, stat = ms_collect_candidates(sport,now)
+            all_candidates.extend(rows)
+            stats[sport] = stat
+        except Exception as exc:
+            stats[sport] = {'error':f'{type(exc).__name__}: {str(exc)[:100]}'}
+            log.exception('3.3 %s multiscan failed',sport)
+    # Protect all historical football events; IDs are namespaced by sport.
+    with db_connect() as con:
+        columns = {r[1] for r in con.execute('PRAGMA table_info(legs)')}
+        if 'sport' in columns:
+            used = {(r[0] or 'football',r[1]) for r in con.execute('SELECT sport,fixture_id FROM legs')}
+        else:
+            used = {('football',r[0]) for r in con.execute('SELECT fixture_id FROM legs')}
+    unique = {}
+    for c in all_candidates:
+        key = (c['sport'],c['fixture'],c['bookmaker'],c['market'],c['selection'])
+        if (c['sport'],c['fixture']) not in used and (key not in unique or c['difference']>unique[key]['difference']):
+            unique[key] = c
+    choices = sorted(unique.values(),key=lambda c:c['difference'],reverse=True)[:100]
+    pairs=[]
+    for x,y in combinations(choices,2):
+        if (x['sport'],x['fixture'])==(y['sport'],y['fixture']): continue
+        if x['bookmaker'].casefold()!=y['bookmaker'].casefold(): continue
+        total = x['odd']*y['odd']
+        if 1.90<=total<=2.10:
+            pairs.append((x['difference']+y['difference'],x,y,total))
+    pairs.sort(key=lambda r:r[0],reverse=True)
+    selected, reserved = [],set()
+    for _,x,y,total in pairs:
+        keys = {(x['sport'],x['fixture']),(y['sport'],y['fixture'])}
+        if keys & reserved: continue
+        selected.append((x,y,total))
+        reserved |= keys
+        if len(selected)==3: break
+    return selected,stats,len(choices)
+
+
+async def multiscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🔎 OddX2 3.3 | Running read-only multisport probability scan...')
+    try:
+        pairs,stats,count = await asyncio.to_thread(multiscan_preview)
+        lines = ['🧪 OddX2 3.3-beta | MULTISPORT RESEARCH',
+                 'NOT published or saved. Model probabilities are uncalibrated.',
+                 f'Eligible candidate markets: {count}']
+        for sport,stat in stats.items():
+            lines.append(f'{sport.title()}: {stat}')
+        for i,(x,y,total) in enumerate(pairs,1):
+            lines.append(f'\nDOUBLE {i} | {x["bookmaker"]} | combined {total:.2f}')
+            for c in (x,y):
+                lines.append(f'{c["sport"].title()} | {c["kick"].astimezone(LOCAL):%d %b %H:%M} | {c["home"]} vs {c["away"]}\n'
+                    f'{c["market"]}: {c["selection"]} @ {c["odd"]:.2f} | model {c["estimated"]:.1%} | raw implied {1/c["odd"]:.1%} '
+                    f'| gap {c["difference"]:+.1%} | {c["sample"]}\n{c["rule"]}')
+        if not pairs: lines.append('No qualifying double. Nothing forced.')
+        lines.append('⚠️ Research only. Basketball OT settlement unverified; hockey 3Way is 60 minutes. No proven betting advantage.')
+        await update.message.reply_text('\n\n'.join(lines)[:3900])
+    except Exception:
+        log.exception('3.3 multiscan failed')
+        await update.message.reply_text('❌ Multisport scan failed. Check Railway logs.')
+
 def main():
     if not TOKEN or not KEY:
         raise RuntimeError('Missing TELEGRAM_BOT_TOKEN or API_FOOTBALL_KEY in Railway')
@@ -1063,9 +1221,9 @@ def main():
                              ('report', raport), ('raport', raport),
                              ('weekly', weekly), ('monthly', monthly),
                              ('alltime', alltime), ('diagnostics', diagnostics),
-                             ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview)]:
+                             ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview), ('multiscan', multiscan_command)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('OddX2 3.2-preview started')
+    log.info('OddX2 3.3-beta started')
     app.run_polling()
 
 
