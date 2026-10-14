@@ -23,7 +23,7 @@ DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 2
 SCAN_LIMIT_PER_DAY = 16
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "5.0-beta"
+VERSION = "5.1-beta"
 MIN_LEAD_MINUTES = 15
 DAILY_SINGLE_TARGET = 20
 MAX_NEW_SINGLES_PER_SCAN = 5
@@ -507,6 +507,103 @@ def singles_db():
     return con
 
 
+# 5.1: read-only contextual review. Missing data is explicitly UNKNOWN.
+# This is not a calibrated adjustment to predicted probabilities.
+def inspect_match_context(fixture_id):
+    result = {'fixture_id': fixture_id, 'warnings': [], 'unknown': [], 'details': []}
+    try:
+        matches = api('fixtures', {'id': fixture_id})
+        if not matches:
+            result['unknown'].append('Fixture details unavailable')
+            return result
+        game = matches[0]
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        result['unknown'].append(f'Fixture lookup failed ({type(exc).__name__})')
+        return result
+    fixture = game.get('fixture') or {}
+    teams = game.get('teams') or {}
+    home = teams.get('home') or {}
+    away = teams.get('away') or {}
+    result['details'].append(f"Fixture: {home.get('name', '?')} vs {away.get('name', '?')}")
+    venue = fixture.get('venue') or {}
+    if venue.get('name'):
+        result['details'].append(f"Listed venue: {venue['name']} ({venue.get('city') or 'city unknown'})")
+        result['unknown'].append('Neutral venue not independently confirmed')
+    else:
+        result['unknown'].append('Venue unavailable; neutral status unknown')
+    try:
+        injuries = api('injuries', {'fixture': fixture_id})
+        if not isinstance(injuries, list):
+            raise ValueError('Unexpected injuries response')
+        relevant = []
+        for entry in injuries:
+            if not isinstance(entry, dict):
+                continue
+            player = entry.get('player') or {}
+            team = entry.get('team') or {}
+            reason = player.get('reason') or player.get('type') or 'reason not supplied'
+            relevant.append(f"{team.get('name', '?')}: {player.get('name', '?')} ({reason})")
+        if relevant:
+            result['warnings'].append(f'{len(relevant)} reported absences; player importance NOT assessed')
+            result['details'].extend(relevant[:8])
+            if len(relevant)>8:
+                result['details'].append(f'...and {len(relevant)-8} more')
+        else:
+            result['unknown'].append('No injuries returned; coverage/completeness not verified')
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        result['unknown'].append(f'Injuries unavailable ({type(exc).__name__})')
+    try:
+        lineups = api('fixtures/lineups', {'fixture': fixture_id})
+        if not isinstance(lineups, list):
+            raise ValueError('Unexpected lineups response')
+        valid = [v for v in lineups if isinstance(v,dict) and isinstance(v.get('startXI'),list) and v['startXI']]
+        if len(valid) == 2:
+            for entry in valid:
+                team_name = (entry.get('team') or {}).get('name', '?')
+                names = [(p.get('player') or {}).get('name','?') for p in entry['startXI']]
+                result['details'].append(f'{team_name} confirmed XI ({len(names)}): '+', '.join(names[:11]))
+            result['unknown'].append('Rotation severity unknown without a validated expected-XI baseline')
+        else:
+            result['unknown'].append('Both confirmed starting XIs not available yet')
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        result['unknown'].append(f'Lineups unavailable ({type(exc).__name__})')
+    result['unknown'].append('Team motivation / qualification incentives not independently verified')
+    result['unknown'].append('Weather and travel load not checked')
+    return result
+
+
+def context_audit_text(limit=8):
+    with singles_db() as con:
+        rows = con.execute("""SELECT id,fixture_id,home,away,kickoff
+            FROM value_picks WHERE published_at IS NOT NULL
+            ORDER BY id DESC LIMIT ?""", (limit,)).fetchall()
+    if not rows:
+        return 'No published individual picks to audit yet.'
+    lines = ['🩺 OddX2 5.1 | MATCH CONTEXT AUDIT',
+             'READ-ONLY. Existing picks, odds, results and ROI unchanged.',
+             'Observational only; missing information does not mean no risk.']
+    for id_, fixture_id, home, away, kickoff in rows:
+        info = inspect_match_context(fixture_id)
+        lines.append(f'\n#{id_} {home} vs {away} | '+
+                     ('PAST KICKOFF' if datetime.fromisoformat(kickoff).astimezone(timezone.utc) <= datetime.now(timezone.utc) else 'UPCOMING'))
+        lines.extend('⚠️ '+w for w in info['warnings'])
+        lines.extend('• '+d for d in info['details'][:6])
+        lines.append('Unknown: '+ '; '.join(info['unknown'][:5]))
+    lines.append('No automated exclusion or model probability adjustment in 5.1.')
+    return '\n'.join(lines)
+
+
+async def contextaudit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🩺 OddX2 5.1 | Checking match context (read-only)...')
+    try:
+        report = await asyncio.to_thread(context_audit_text, 5)
+        for start in range(0, len(report), 3800):
+            await update.message.reply_text(report[start:start+3800])
+    except Exception:
+        log.exception('Context audit failed')
+        await update.message.reply_text('Context audit unavailable. Check Railway logs; picks unchanged.')
+
+
 def select_value_picks(limit=5):
     quotes, inspected, history_ok, candidates = analyze_batch(singles_mode=True)
     with singles_db() as con:
@@ -707,7 +804,7 @@ def value_report(period='all'):
 
 
 async def value_scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔎 OddX2 5.0 | Scanning individual football value picks...')
+    await update.message.reply_text('🔎 OddX2 5.1 | Scanning individual football value picks...')
     status = await asyncio.to_thread(value_scan)
     await publish_value_picks(context.application)
     await update.message.reply_text(f'Individual scan: {status}. See /picks and /report.')
@@ -1952,9 +2049,9 @@ def main():
                              ('report', value_report_command), ('raport', value_report_command), ('today', value_today_command),
                              ('weekly', value_weekly_command), ('monthly', value_monthly_command),
                              ('alltime', value_report_command), ('diagnostics', diagnostics), ('footballaudit', footballaudit), ('pairaudit', pairaudit),
-                             ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview), ('multiscan', multiscan_command), ('backtest', backtest_command), ('marketcheck', marketcheck_command)]:
+                             ('contextaudit', contextaudit_command), ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview), ('multiscan', multiscan_command), ('backtest', backtest_command), ('marketcheck', marketcheck_command)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('OddX2 5.0-beta started')
+    log.info('OddX2 5.1-beta started')
     app.run_polling()
 
 
