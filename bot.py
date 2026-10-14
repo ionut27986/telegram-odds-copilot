@@ -23,7 +23,7 @@ DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 2
 SCAN_LIMIT_PER_DAY = 16
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "3.9-beta"
+VERSION = "4.0-beta"
 MIN_LEAD_MINUTES = 15
 DAILY_DOUBLE_TARGET = 10
 MAX_NEW_DOUBLES_PER_SCAN = 3
@@ -257,16 +257,42 @@ def analyze_batch(max_doubles=3, audit=None):
         if key not in unique or c['odd'] > unique[key]['odd']:
             unique[key] = c
     choices = sorted(unique.values(), key=lambda c: c['difference'], reverse=True)[:150]
+    if audit is not None:
+        audit['unique_quotes'] = len(choices)
+        audit['before_reuse'] = len(choices)
     with db_connect() as con:
         used = {r[0] for r in con.execute('SELECT fixture_id FROM legs')}
     choices = [c for c in choices if c['fixture'] not in used]
+    if audit is not None:
+        audit['reused_quotes'] = audit['before_reuse'] - len(choices)
+        audit['distinct_events'] = len({c['fixture'] for c in choices})
+        audit['bookmakers'] = len({c['bookmaker'] for c in choices})
+        audit['pair_filters'] = {'same_event': 0, 'different_bookmaker': 0,
+                                 'outside_target': 0, 'qualifying': 0}
+        audit['data_quality'] = {'minimum_5_to_6': 0, 'moderate_7_to_9': 0,
+                                 'strong_10_plus': 0}
+        for c in choices:
+            sample = min(c['home_n'], c['away_n'])
+            tier = ('minimum_5_to_6' if sample <= 6 else
+                    'moderate_7_to_9' if sample <= 9 else 'strong_10_plus')
+            audit['data_quality'][tier] += 1
     ranked = []
     for x, y in combinations(choices, 2):
-        if x['fixture'] == y['fixture'] or x['bookmaker'] != y['bookmaker']:
+        if x['fixture'] == y['fixture']:
+            if audit is not None:
+                audit['pair_filters']['same_event'] += 1
+            continue
+        if x['bookmaker'] != y['bookmaker']:
+            if audit is not None:
+                audit['pair_filters']['different_bookmaker'] += 1
             continue
         combined = x['odd'] * y['odd']
         if not 1.90 <= combined <= 2.10:
+            if audit is not None:
+                audit['pair_filters']['outside_target'] += 1
             continue
+        if audit is not None:
+            audit['pair_filters']['qualifying'] += 1
         score = x['difference'] + y['difference'] - 0.1 * abs(combined - 2)
         ranked.append((score, x, y, combined))
     ranked.sort(key=lambda item: item[0], reverse=True)
@@ -278,6 +304,16 @@ def analyze_batch(max_doubles=3, audit=None):
         reserved.update((x['fixture'], y['fixture']))
         if len(selected) >= max_doubles:
             break
+    if audit is not None:
+        audit['ranked_pairs'] = len(ranked)
+        audit['selected_pairs'] = len(selected)
+        audit['top_pairs'] = [
+            {'a': f"{x['home']} vs {x['away']}", 'b': f"{y['home']} vs {y['away']}",
+             'bookmaker': x['bookmaker'], 'combined': total,
+             'gap': x['difference'] + y['difference'],
+             'samples': (min(x['home_n'], x['away_n']), min(y['home_n'], y['away_n']))}
+            for _, x, y, total in ranked[:5]
+        ]
     return selected, inspected, qualified, len(choices)
 
 
@@ -323,11 +359,11 @@ def find_double():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🤖 OddX2 3.9-beta online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/weekly - last completed week\n/monthly - last completed month\n/alltime - published track record\n/diagnostics - scan reasons\n/footballaudit - football coverage\n/sports - check basketball and hockey feeds\n/basketball - basketball research preview\n/hockey - hockey research preview\n/multiscan - multisport diagnostic research')
+    await update.message.reply_text('🤖 OddX2 4.0-beta online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/weekly - last completed week\n/monthly - last completed month\n/alltime - published track record\n/diagnostics - scan reasons\n/footballaudit - football coverage\n/pairaudit - football pair filters\n/sports - check basketball and hockey feeds\n/basketball - basketball research preview\n/hockey - hockey research preview\n/multiscan - multisport diagnostic research')
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('✅ OddX2 3.9-beta is online.')
+    await update.message.reply_text('✅ OddX2 4.0-beta is online.')
 
 
 async def meciuri(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -601,7 +637,7 @@ def settle_pending():
 
 
 async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔎 OddX2 3.9 — Running statistical analysis...')
+    await update.message.reply_text('🔎 OddX2 4.0 — Running statistical analysis...')
     try:
         best, checked, qualified, count = await asyncio.to_thread(analyze)
         if not best:
@@ -612,7 +648,7 @@ async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         saved = await asyncio.to_thread(save_double, best)
         x, y, total = best
-        lines = ['🧪 OddX2 3.9 — Poisson model', 'Experimental statistical analysis', '']
+        lines = ['🧪 OddX2 4.0 — Poisson model', 'Experimental statistical analysis', '']
         for i, c in enumerate((x, y), 1):
             lines.extend([
                 f"{i}. {c['home']} vs {c['away']} — {c['kick'].astimezone(LOCAL):%H:%M}",
@@ -898,12 +934,12 @@ async def diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def footballaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔎 OddX2 3.9 | Auditing football coverage (read-only)...')
+    await update.message.reply_text('🔎 OddX2 4.0 | Auditing football coverage (read-only)...')
     try:
         audit = {}
         selected, inspected, qualified, candidates = await asyncio.to_thread(analyze_batch, 1, audit)
         lines = [
-            '⚽ OddX2 3.9 | FOOTBALL COVERAGE AUDIT',
+            '⚽ OddX2 4.0 | FOOTBALL COVERAGE AUDIT',
             f'20h fixtures: {audit["total"]} | analysis budget: {FOOTBALL_SCAN_BUDGET} | selected: {audit["selected"]}',
             f'Equal-priority UEFA/Top 5 reserve: {FOOTBALL_PRIORITY_RESERVE}; remaining slots for other competitions',
             f'Checked: {inspected} | enough history: {qualified} | eligible quotes: {candidates}',
@@ -922,6 +958,53 @@ async def footballaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         log.exception('Football audit failed')
         await update.message.reply_text('❌ Football audit failed. Check Railway logs.')
+
+
+async def pairaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Read-only audit: uses the same model and constraints as the live scan."""
+    await update.message.reply_text('🔎 OddX2 4.0 | Auditing football pair construction (read-only)...')
+    try:
+        audit = {}
+        _, checked, history, remaining = await asyncio.to_thread(analyze_batch, 3, audit)
+        f = audit.get('pair_filters', {})
+        q = audit.get('data_quality', {})
+        lines = [
+            '⚽ OddX2 4.0 | FOOTBALL PAIR AUDIT',
+            'Read-only. No records saved or channel posts created.',
+            f'Fixtures: {audit.get("total", 0)} available | {audit.get("selected", 0)} selected '
+            f'| {checked} inspected | {history} with sufficient history',
+            f'Quotes: {audit.get("unique_quotes", 0)} unique after ranking cap (150) '
+            f'| {audit.get("reused_quotes", 0)} excluded due to historical reuse '
+            f'| {remaining} remaining',
+            f'Distinct events: {audit.get("distinct_events", 0)} '
+            f'| bookmakers: {audit.get("bookmakers", 0)}',
+            'QUOTE SAMPLE QUALITY (not independent games):',
+            f'5-6 home/away samples: {q.get("minimum_5_to_6", 0)}',
+            f'7-9 home/away samples: {q.get("moderate_7_to_9", 0)}',
+            f'10+ home/away samples: {q.get("strong_10_plus", 0)}',
+            'PAIR FILTERS (sequential; counts are mutually exclusive):',
+            f'Same fixture: {f.get("same_event", 0)}',
+            f'Different bookmaker: {f.get("different_bookmaker", 0)}',
+            f'Outside combined 1.90-2.10: {f.get("outside_target", 0)}',
+            f'Qualifying combinations: {f.get("qualifying", 0)}',
+            f'Independent doubles available in this scan: {audit.get("selected_pairs", 0)}',
+        ]
+        if audit.get('top_pairs'):
+            lines.append('TOP PAIRS (not posted):')
+            for pair in audit['top_pairs']:
+                lines.append(
+                    f'{pair["a"]} + {pair["b"]} | {pair["bookmaker"]} '
+                    f'@ {pair["combined"]:.2f} | sum model gaps {pair["gap"]:+.1%} '
+                    f'| samples {pair["samples"][0]}/{pair["samples"][1]}'
+                )
+        lines.append('Model gaps are uncalibrated; a positive gap is NOT proof of value. '
+                     'Competitions are prioritized for coverage, not assigned bonus probabilities.')
+        message = '\n\n'.join(lines)
+        for i in range(0, len(message), 3800):
+            await update.message.reply_text(message[i:i+3800])
+    except Exception:
+        log.exception('Football pair audit failed')
+        await update.message.reply_text('❌ Pair audit error. Check Railway logs.')
 
 
 async def scheduled_reports(app):
@@ -1591,10 +1674,10 @@ def main():
                              ('scan', scanare), ('scanare', scanare),
                              ('report', raport), ('raport', raport),
                              ('weekly', weekly), ('monthly', monthly),
-                             ('alltime', alltime), ('diagnostics', diagnostics), ('footballaudit', footballaudit),
+                             ('alltime', alltime), ('diagnostics', diagnostics), ('footballaudit', footballaudit), ('pairaudit', pairaudit),
                              ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview), ('multiscan', multiscan_command), ('backtest', backtest_command), ('marketcheck', marketcheck_command)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('OddX2 3.9-beta started')
+    log.info('OddX2 4.0-beta started')
     app.run_polling()
 
 
