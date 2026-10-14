@@ -23,7 +23,7 @@ DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 2
 SCAN_LIMIT_PER_DAY = 16
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "3.7-beta"
+VERSION = "3.7.1-beta"
 MIN_LEAD_MINUTES = 15
 DAILY_DOUBLE_TARGET = 10
 MAX_NEW_DOUBLES_PER_SCAN = 3
@@ -1446,12 +1446,12 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def marketcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Inspect current quoted lines without storing them as historical odds."""
-    await update.message.reply_text('📊 OddX2 3.7 | Checking currently offered multisport lines...')
-    lines = ['📊 OddX2 3.7-beta | LIVE LINE AUDIT',
+    await update.message.reply_text('📊 OddX2 3.7.1 | Checking currently offered multisport lines...')
+    lines = ['📊 OddX2 3.7.1-beta | LIVE LINE AUDIT',
              'Research only. These are current quotes, NOT historical pre-match prices.']
     for sport in ('basketball', 'hockey'):
         try:
-            candidates, stat = await asyncio.to_thread(ms_collect_candidates, sport)
+            candidates, stat = await asyncio.to_thread(ms_collect_candidates, sport, datetime.now(timezone.utc))
             events = {}
             for c in candidates:
                 key = c['fixture']
