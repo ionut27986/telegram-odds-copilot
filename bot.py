@@ -23,8 +23,11 @@ DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 2
 SCAN_LIMIT_PER_DAY = 16
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "4.0-beta"
+VERSION = "5.0-beta"
 MIN_LEAD_MINUTES = 15
+DAILY_SINGLE_TARGET = 20
+MAX_NEW_SINGLES_PER_SCAN = 5
+# Legacy constants retained only for dormant historical functions.
 DAILY_DOUBLE_TARGET = 10
 MAX_NEW_DOUBLES_PER_SCAN = 3
 
@@ -173,7 +176,7 @@ def prioritize_football_fixtures(games):
     return selected
 
 
-def analyze_batch(max_doubles=3, audit=None):
+def analyze_batch(max_doubles=3, audit=None, singles_mode=False):
     """Rank multiple independent experimental football doubles."""
     cache, choices = {}, []
     inspected, qualified = 0, 0
@@ -190,7 +193,7 @@ def analyze_batch(max_doubles=3, audit=None):
         for kick, game in prioritized:
             audit['leagues'][league_label(game)]['selected'] += 1
     for kick, game in prioritized:
-        if kick <= datetime.now(timezone.utc) + timedelta(minutes=MIN_LEAD_MINUTES + 2):
+        if kick <= datetime.now(timezone.utc) + timedelta(minutes=MIN_LEAD_MINUTES + 10):
             continue
         teams = game.get('teams', {})
         h, a = teams.get('home', {}), teams.get('away', {})
@@ -230,7 +233,7 @@ def analyze_batch(max_doubles=3, audit=None):
                             odd = float(outcome.get('odd'))
                         except (TypeError, ValueError):
                             continue
-                        if not math.isfinite(odd) or not 1.25 <= odd <= 1.85:
+                        if not math.isfinite(odd) or not (1.25 <= odd <= (3.00 if singles_mode else 1.85)):
                             continue
                         estimated = goal_probability(market, home_lambda, away_lambda)
                         implied = 1 / odd
@@ -250,12 +253,17 @@ def analyze_batch(max_doubles=3, audit=None):
                             'difference': difference,
                             'home_lambda': home_lambda, 'away_lambda': away_lambda,
                             'home_n': len(home), 'away_n': len(away),
+                            'league': league_label(game),
                         })
     unique = {}
     for c in choices:
         key = (c['fixture'], c['market'], c['selection'], c['bookmaker'])
         if key not in unique or c['odd'] > unique[key]['odd']:
             unique[key] = c
+    if singles_mode:
+        # No global top-150 cap before filtering already published events.
+        # Expected value is only a model estimate, not demonstrated profitability.
+        return sorted(unique.values(), key=lambda c: (c['estimated']*c['odd']-1, c['difference']), reverse=True), inspected, qualified, len(unique)
     choices = sorted(unique.values(), key=lambda c: c['difference'], reverse=True)[:150]
     if audit is not None:
         audit['unique_quotes'] = len(choices)
@@ -359,11 +367,11 @@ def find_double():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🤖 OddX2 4.0-beta online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/weekly - last completed week\n/monthly - last completed month\n/alltime - published track record\n/diagnostics - scan reasons\n/footballaudit - football coverage\n/pairaudit - football pair filters\n/sports - check basketball and hockey feeds\n/basketball - basketball research preview\n/hockey - hockey research preview\n/multiscan - multisport diagnostic research')
+    await update.message.reply_text('🤖 OddX2 5.0-beta online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/weekly - last completed week\n/monthly - last completed month\n/alltime - published track record\n/diagnostics - scan reasons\n/footballaudit - football coverage\n/pairaudit - football pair filters\n/sports - check basketball and hockey feeds\n/basketball - basketball research preview\n/hockey - hockey research preview\n/multiscan - multisport diagnostic research')
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('✅ OddX2 4.0-beta is online.')
+    await update.message.reply_text('✅ OddX2 5.0-beta is online.')
 
 
 async def meciuri(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -467,6 +475,274 @@ def db_connect():
     con.commit()
     return con
 
+
+
+# 5.0 uses an independent ledger. Legacy doubles and their historical results
+# are retained intact but are no longer posted or included in the new ROI.
+def singles_db():
+    con = db_connect()
+    con.execute('''CREATE TABLE IF NOT EXISTS value_picks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        published_at TEXT,
+        result_posted_at TEXT,
+        fixture_id INTEGER NOT NULL UNIQUE,
+        kickoff TEXT NOT NULL,
+        league TEXT NOT NULL,
+        home TEXT NOT NULL, away TEXT NOT NULL,
+        bookmaker TEXT NOT NULL, market TEXT NOT NULL, selection TEXT NOT NULL,
+        market_kind TEXT NOT NULL, positive INTEGER NOT NULL, threshold REAL,
+        odd REAL NOT NULL, estimated REAL NOT NULL, implied REAL NOT NULL,
+        estimated_ev REAL NOT NULL, home_n INTEGER NOT NULL, away_n INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        home_goals INTEGER, away_goals INTEGER
+    )''')
+    con.execute('''CREATE TABLE IF NOT EXISTS value_scan_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, scanned_at TEXT NOT NULL,
+        status TEXT NOT NULL, inspected INTEGER NOT NULL DEFAULT 0,
+        history_ok INTEGER NOT NULL DEFAULT 0, candidates INTEGER NOT NULL DEFAULT 0,
+        saved INTEGER NOT NULL DEFAULT 0, detail TEXT NOT NULL DEFAULT ''
+    )''')
+    con.commit()
+    return con
+
+
+def select_value_picks(limit=5):
+    quotes, inspected, history_ok, candidates = analyze_batch(singles_mode=True)
+    with singles_db() as con:
+        old = {row[0] for row in con.execute('SELECT fixture_id FROM value_picks')}
+        # Legacy doubles may overlap. Their returns are tracked separately.
+        old.update(row[0] for row in con.execute('''SELECT legs.fixture_id FROM legs JOIN doubles ON doubles.id=legs.double_id WHERE doubles.published_at IS NOT NULL'''))
+    seen = set()
+    selected = []
+    for quote in quotes:
+        event = quote['fixture']
+        if event in old or event in seen:
+            continue
+        # Avoid multiple highly correlated bets from one event.
+        seen.add(event)
+        selected.append(quote)
+        if len(selected) >= limit:
+            break
+    return selected, inspected, history_ok, candidates
+
+
+def value_scan():
+    now = datetime.now(timezone.utc)
+    today = now.astimezone(LOCAL).date()
+    with singles_db() as con:
+        runs = con.execute('SELECT scanned_at FROM value_scan_runs ORDER BY id DESC LIMIT 100').fetchall()
+        saved = con.execute('SELECT created_at FROM value_picks').fetchall()
+    n_scans = sum(datetime.fromisoformat(t).astimezone(LOCAL).date() == today for (t,) in runs)
+    n_saved = sum(datetime.fromisoformat(t).astimezone(LOCAL).date() == today for (t,) in saved)
+    if n_scans >= SCAN_LIMIT_PER_DAY:
+        return 'daily_scan_limit_reached'
+    if n_saved >= DAILY_SINGLE_TARGET:
+        return 'daily_research_target_reached'
+    inspected = history_ok = candidates = saved_count = 0
+    try:
+        picks, inspected, history_ok, candidates = select_value_picks(
+            min(MAX_NEW_SINGLES_PER_SCAN, DAILY_SINGLE_TARGET-n_saved))
+        with singles_db() as con:
+            for c in picks:
+                cur = con.execute('''INSERT OR IGNORE INTO value_picks (
+                    created_at,fixture_id,kickoff,league,home,away,bookmaker,market,
+                    selection,market_kind,positive,threshold,odd,estimated,implied,
+                    estimated_ev,home_n,away_n
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(
+                    now.isoformat(), c['fixture'], c['kick'].isoformat(),c['league'],
+                    c['home'],c['away'],c['bookmaker'],c['market'],c['selection'],
+                    c['market_kind'],int(c['positive']),c['threshold'],c['odd'],
+                    c['estimated'],c['implied'],c['estimated']*c['odd']-1,
+                    c['home_n'],c['away_n']))
+                saved_count += cur.rowcount
+        status = f'saved_{saved_count}' if saved_count else 'no_new_qualifying_single'
+        detail = 'football; one quote per event; model estimates uncalibrated'
+    except Exception as exc:
+        log.exception('5.0 value scan failed')
+        status, detail = 'error', f'{type(exc).__name__}: {str(exc)[:160]}'
+    with singles_db() as con:
+        con.execute('''INSERT INTO value_scan_runs
+            (scanned_at,status,inspected,history_ok,candidates,saved,detail)
+            VALUES (?,?,?,?,?,?,?)''',
+            (now.isoformat(),status,inspected,history_ok,candidates,saved_count,detail))
+    return status
+
+
+def pending_value_posts():
+    now = datetime.now(timezone.utc)
+    with singles_db() as con:
+        rows = con.execute('''SELECT id,kickoff,created_at,league,home,away,bookmaker,
+            market,selection,odd,estimated,implied,estimated_ev,home_n,away_n
+            FROM value_picks WHERE published_at IS NULL ORDER BY id''').fetchall()
+    valid = []
+    for row in rows:
+        kickoff = datetime.fromisoformat(row[1]).astimezone(timezone.utc)
+        created = datetime.fromisoformat(row[2]).astimezone(timezone.utc)
+        if kickoff > now+timedelta(minutes=MIN_LEAD_MINUTES) and now-created < timedelta(minutes=15):
+            valid.append(row)
+    return valid
+
+
+async def publish_value_picks(app):
+    if not CHANNEL_ID:
+        return
+    for row in await asyncio.to_thread(pending_value_posts):
+        (id_, kick, created, league, home, away, book, market, selection,
+         odd, estimated, implied, ev, hn, an) = row
+        local = datetime.fromisoformat(kick).astimezone(LOCAL)
+        msg = (f'📊 OddX2 | VALUE PICK #{id_}\n'
+               f'{home} vs {away}\n{league}\n'
+               f'Kickoff: {local:%d %b %Y, %H:%M} (Bucharest)\n'
+               f'{market}: {selection} @ {odd:.2f}\nBookmaker: {book}\n'
+               f'Implied probability: {implied:.1%}\n'
+               f'Experimental model probability: {estimated:.1%}\n'
+               f'Estimated EV: {ev:+.1%}\n'
+               f'Historical sample: {hn} home / {an} away\n'
+               '⚠️ Uncalibrated model; positive EV is not proven value. '
+               'Odds may change. Research only, no guaranteed returns.')
+        await app.bot.send_message(chat_id=CHANNEL_ID,text=msg)
+        with singles_db() as con:
+            con.execute('UPDATE value_picks SET published_at=? WHERE id=? AND published_at IS NULL',
+                        (datetime.now(timezone.utc).isoformat(),id_))
+
+
+def settle_value_picks():
+    with singles_db() as con:
+        rows = con.execute("SELECT id,fixture_id,market_kind,positive,threshold FROM value_picks WHERE status='pending'").fetchall()
+        cache = {}
+        changed = 0
+        for id_, fixture, kind, positive, threshold in rows:
+            if fixture not in cache:
+                try:
+                    games = api('fixtures', {'id': fixture})
+                    cache[fixture] = games[0] if games else None
+                except (requests.RequestException, ValueError):
+                    log.exception('5.0 settlement lookup failed for %s', fixture)
+                    cache[fixture] = None
+            game = cache[fixture]
+            if not game:
+                continue
+            status = (game.get('fixture') or {}).get('status',{}).get('short')
+            if status in ('CANC','PST','ABD','AWD','WO'):
+                result, hg, ag = 'void', None, None
+            elif status == 'FT':
+                goals = game.get('goals') or {}
+                hg, ag = goals.get('home'),goals.get('away')
+                if not isinstance(hg,int) or not isinstance(ag,int):
+                    continue
+                if kind == 'goals':
+                    hit = ((hg+ag)>threshold) == bool(positive)
+                elif kind == 'btts':
+                    hit = ((hg>0 and ag>0) == bool(positive))
+                else:
+                    continue
+                result = 'won' if hit else 'lost'
+            else:
+                continue
+            con.execute('UPDATE value_picks SET status=?,home_goals=?,away_goals=? WHERE id=?',
+                        (result,hg,ag,id_))
+            changed += 1
+    return changed
+
+
+async def publish_value_results(app):
+    if not CHANNEL_ID:
+        return
+    with singles_db() as con:
+        rows = con.execute('''SELECT id,status,odd,home_goals,away_goals
+            FROM value_picks WHERE published_at IS NOT NULL
+            AND result_posted_at IS NULL AND status IN ('won','lost','void') ORDER BY id''').fetchall()
+    for id_,status,odd,hg,ag in rows:
+        pnl = odd-1 if status=='won' else (-1 if status=='lost' else 0)
+        msg = (f'🏁 OddX2 | PICK #{id_} RESULT\n{status.upper()}\n'
+               f'Score: {hg if hg is not None else "-"}-{ag if ag is not None else "-"}\n'
+               f'Quoted odds: {odd:.2f}\nHypothetical P/L: {pnl:+.2f} units\n'
+               '1-unit hypothetical tracking; no real wagers.')
+        await app.bot.send_message(chat_id=CHANNEL_ID,text=msg)
+        with singles_db() as con:
+            con.execute('UPDATE value_picks SET result_posted_at=? WHERE id=? AND result_posted_at IS NULL',
+                        (datetime.now(timezone.utc).isoformat(),id_))
+
+
+def value_report(period='all'):
+    now = datetime.now(LOCAL)
+    if period=='week':
+        end = (now-timedelta(days=now.weekday())).replace(hour=0,minute=0,second=0,microsecond=0)
+        start = end-timedelta(days=7)
+        label = f'{start:%d %b} - {(end-timedelta(days=1)):%d %b %Y}'
+    elif period=='month':
+        end = now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
+        start = (end-timedelta(days=1)).replace(day=1)
+        label = f'{start:%B %Y}'
+    elif period=='today':
+        start = now.replace(hour=0,minute=0,second=0,microsecond=0)
+        end = start+timedelta(days=1)
+        label = f'{start:%d %b %Y}'
+    else:
+        start=end=None
+        label='All time'
+    with singles_db() as con:
+        rows=con.execute('''SELECT published_at,status,odd FROM value_picks
+            WHERE published_at IS NOT NULL''').fetchall()
+    if start:
+        rows=[r for r in rows if start <= datetime.fromisoformat(r[0]).astimezone(LOCAL) < end]
+    wins=sum(r[1]=='won' for r in rows)
+    losses=sum(r[1]=='lost' for r in rows)
+    voids=sum(r[1]=='void' for r in rows)
+    pending=sum(r[1]=='pending' for r in rows)
+    settled=wins+losses
+    pnl=sum((odd-1 if state=='won' else -1) for _,state,odd in rows if state in ('won','lost'))
+    return (f'📈 OddX2 | INDIVIDUAL PICKS PERFORMANCE\nPeriod: {label}\n'
+            f'Published: {len(rows)} | Won: {wins} | Lost: {losses} | '
+            f'Void: {voids} | Pending: {pending}\n'
+            f'Settled stake: {settled} units (voids excluded)\n'
+            f'Hypothetical P/L: {pnl:+.2f} units\n'
+            f'ROI: {pnl/settled:+.1%}' if settled else
+            f'📈 OddX2 | INDIVIDUAL PICKS PERFORMANCE\nPeriod: {label}\n'
+            f'Published: {len(rows)} | Won: {wins} | Lost: {losses} | '
+            f'Void: {voids} | Pending: {pending}\nROI: N/A') + (
+            '\nPublished picks only; fixed hypothetical 1-unit stakes. '
+            'No actual bets. Legacy doubles excluded. Historical periods update as picks settle.')
+
+
+async def value_scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🔎 OddX2 5.0 | Scanning individual football value picks...')
+    status = await asyncio.to_thread(value_scan)
+    await publish_value_picks(context.application)
+    await update.message.reply_text(f'Individual scan: {status}. See /picks and /report.')
+
+
+async def value_picks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with singles_db() as con:
+        rows=con.execute('''SELECT id,home,away,selection,odd,status,estimated_ev
+            FROM value_picks WHERE published_at IS NOT NULL ORDER BY id DESC LIMIT 12''').fetchall()
+    if not rows:
+        await update.message.reply_text('No published individual picks yet.')
+        return
+    await update.message.reply_text('📋 OddX2 | RECENT INDIVIDUAL PICKS\n'+
+        '\n'.join(f'#{id_} {home} vs {away} | {selection} @ {odd:.2f} | {status.upper()} | model EV {ev:+.1%}'
+                  for id_,home,away,selection,odd,status,ev in rows))
+
+
+async def value_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await asyncio.to_thread(value_report,'all'))
+
+
+async def value_weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await asyncio.to_thread(value_report,'week'))
+
+
+async def value_monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await asyncio.to_thread(value_report,'month'))
+
+
+async def value_today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await asyncio.to_thread(value_report,'today'))
+
+
+async def legacy_notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('OddX2 5.0 publishes individual picks only. Historical doubles are retained but no new doubles are generated. Use /scan, /picks or /report.')
 
 def save_double(best):
     x, y, total = best
@@ -637,7 +913,7 @@ def settle_pending():
 
 
 async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔎 OddX2 4.0 — Running statistical analysis...')
+    await update.message.reply_text('🔎 OddX2 5.0 — Running statistical analysis...')
     try:
         best, checked, qualified, count = await asyncio.to_thread(analyze)
         if not best:
@@ -648,7 +924,7 @@ async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         saved = await asyncio.to_thread(save_double, best)
         x, y, total = best
-        lines = ['🧪 OddX2 4.0 — Poisson model', 'Experimental statistical analysis', '']
+        lines = ['🧪 OddX2 5.0 — Poisson model', 'Experimental statistical analysis', '']
         for i, c in enumerate((x, y), 1):
             lines.extend([
                 f"{i}. {c['home']} vs {c['away']} — {c['kick'].astimezone(LOCAL):%H:%M}",
@@ -934,12 +1210,12 @@ async def diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def footballaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔎 OddX2 4.0 | Auditing football coverage (read-only)...')
+    await update.message.reply_text('🔎 OddX2 5.0 | Auditing football coverage (read-only)...')
     try:
         audit = {}
         selected, inspected, qualified, candidates = await asyncio.to_thread(analyze_batch, 1, audit)
         lines = [
-            '⚽ OddX2 4.0 | FOOTBALL COVERAGE AUDIT',
+            '⚽ OddX2 5.0 | FOOTBALL COVERAGE AUDIT',
             f'20h fixtures: {audit["total"]} | analysis budget: {FOOTBALL_SCAN_BUDGET} | selected: {audit["selected"]}',
             f'Equal-priority UEFA/Top 5 reserve: {FOOTBALL_PRIORITY_RESERVE}; remaining slots for other competitions',
             f'Checked: {inspected} | enough history: {qualified} | eligible quotes: {candidates}',
@@ -962,14 +1238,14 @@ async def footballaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def pairaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Read-only audit: uses the same model and constraints as the live scan."""
-    await update.message.reply_text('🔎 OddX2 4.0 | Auditing football pair construction (read-only)...')
+    await update.message.reply_text('🔎 OddX2 5.0 | Auditing football pair construction (read-only)...')
     try:
         audit = {}
         _, checked, history, remaining = await asyncio.to_thread(analyze_batch, 3, audit)
         f = audit.get('pair_filters', {})
         q = audit.get('data_quality', {})
         lines = [
-            '⚽ OddX2 4.0 | FOOTBALL PAIR AUDIT',
+            '⚽ OddX2 5.0 | FOOTBALL PAIR AUDIT',
             'Read-only. No records saved or channel posts created.',
             f'Fixtures: {audit.get("total", 0)} available | {audit.get("selected", 0)} selected '
             f'| {checked} inspected | {history} with sufficient history',
@@ -1019,14 +1295,14 @@ async def scheduled_reports(app):
                                   else (now.replace(day=1) - timedelta(days=1)).strftime('%Y-%m'))
                     with db_connect() as con:
                         already = con.execute('SELECT 1 FROM report_posts WHERE period_type=? AND period_key=?',
-                                              (kind,period_key)).fetchone()
+                                              ('singles_'+kind,period_key)).fetchone()
                     if already:
                         continue
-                    message = await asyncio.to_thread(performance_report,kind)
+                    message = await asyncio.to_thread(value_report,kind)
                     await app.bot.send_message(chat_id=CHANNEL_ID, text=message)
                     with db_connect() as con:
                         con.execute('INSERT OR IGNORE INTO report_posts(period_type,period_key,sent_at) VALUES(?,?,?)',
-                                    (kind,period_key,datetime.now(timezone.utc).isoformat()))
+                                    ('singles_'+kind,period_key,datetime.now(timezone.utc).isoformat()))
         except Exception:
             log.exception('Scheduled report failed')
         await asyncio.sleep(3600)
@@ -1047,9 +1323,9 @@ async def periodic_scanning(app):
     await asyncio.sleep(300)
     while True:
         try:
-            state = await asyncio.to_thread(automated_scan)
+            state = await asyncio.to_thread(value_scan)
             log.info('Automated research scan: %s', state)
-            await publish_updates(app)
+            await publish_value_picks(app)
         except Exception:
             log.exception('Research scan failed')
         await asyncio.sleep(AUTO_SCAN_HOURS * 3600)
@@ -1059,8 +1335,9 @@ async def periodic_settlement(app):
     while True:
         await asyncio.sleep(1800)
         try:
-            await asyncio.to_thread(settle_pending)
-            await publish_results_and_summary(app)
+            await asyncio.to_thread(settle_pending)  # preserve legacy ledger settlement
+            await asyncio.to_thread(settle_value_picks)
+            await publish_value_results(app)
         except Exception:
             log.exception('Background settlement failed')
 
@@ -1086,11 +1363,11 @@ async def on_startup(app):
     app.create_task(periodic_scanning(app))
     app.create_task(scheduled_reports(app))
     app.create_task(periodic_sport_observations(app))
-    app.create_task(publish_updates(app))
+    app.create_task(publish_value_picks(app))
 
 
 def db_connect_and_close():
-    con = db_connect()
+    con = singles_db()
     con.close()
 
 
@@ -1666,18 +1943,18 @@ def main():
     for command, handler in [('start', start), ('status', status),
                              ('fixtures', meciuri), ('meciuri', meciuri),
                              ('odds', cote), ('cote', cote),
-                             ('double', dubla), ('dubla', dubla),
-                             ('analyze', analiza), ('analiza', analiza),
-                             ('history', istoric), ('istoric', istoric),
-                             ('stats', statistici), ('statistici', statistici),
-                             ('results', verifica), ('verifica', verifica),
-                             ('scan', scanare), ('scanare', scanare),
-                             ('report', raport), ('raport', raport),
-                             ('weekly', weekly), ('monthly', monthly),
-                             ('alltime', alltime), ('diagnostics', diagnostics), ('footballaudit', footballaudit), ('pairaudit', pairaudit),
+                             ('double', legacy_notice), ('dubla', legacy_notice),
+                             ('analyze', legacy_notice), ('analiza', legacy_notice),
+                             ('history', value_picks_command), ('istoric', value_picks_command), ('picks', value_picks_command),
+                             ('stats', value_report_command), ('statistici', value_report_command),
+                             ('results', value_picks_command), ('verifica', value_picks_command),
+                             ('scan', value_scan_command), ('scanare', value_scan_command),
+                             ('report', value_report_command), ('raport', value_report_command), ('today', value_today_command),
+                             ('weekly', value_weekly_command), ('monthly', value_monthly_command),
+                             ('alltime', value_report_command), ('diagnostics', diagnostics), ('footballaudit', footballaudit), ('pairaudit', pairaudit),
                              ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview), ('multiscan', multiscan_command), ('backtest', backtest_command), ('marketcheck', marketcheck_command)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('OddX2 4.0-beta started')
+    log.info('OddX2 5.0-beta started')
     app.run_polling()
 
 
