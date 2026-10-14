@@ -23,7 +23,7 @@ DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 2
 SCAN_LIMIT_PER_DAY = 16
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "3.8-beta"
+VERSION = "3.9-beta"
 MIN_LEAD_MINUTES = 15
 DAILY_DOUBLE_TARGET = 10
 MAX_NEW_DOUBLES_PER_SCAN = 3
@@ -124,8 +124,8 @@ def goal_probability(market, home_lambda, away_lambda):
 # Domestic: Premier League 39, La Liga 140, Bundesliga 78, Serie A 135, Ligue 1 61.
 TOP_UEFA_LEAGUES = {2, 3, 848}
 TOP_DOMESTIC_LEAGUES = {39, 140, 78, 135, 61}
-FOOTBALL_SCAN_BUDGET = 45
-FOOTBALL_PRIORITY_RESERVE = 30
+FOOTBALL_SCAN_BUDGET = 120
+FOOTBALL_PRIORITY_RESERVE = 80
 
 
 def league_label(game):
@@ -148,16 +148,29 @@ def football_priority(game):
 
 
 def prioritize_football_fixtures(games):
-    """Reserve top-competition coverage while retaining general-league discovery."""
-    top = [(kick, game) for kick, game in games if football_priority(game) < 2]
-    other = [(kick, game) for kick, game in games if football_priority(game) == 2]
-    top.sort(key=lambda item: (football_priority(item[1]), item[0]))
-    top_selected = top[:FOOTBALL_PRIORITY_RESERVE]
-    general_selected = other[:FOOTBALL_SCAN_BUDGET - len(top_selected)]
-    remaining = FOOTBALL_SCAN_BUDGET - len(top_selected) - len(general_selected)
-    if remaining:
-        general_selected += top[FOOTBALL_PRIORITY_RESERVE:FOOTBALL_PRIORITY_RESERVE + remaining]
-    return top_selected + general_selected
+    """Equal-priority UEFA and Top 5 coverage, with space for other leagues.
+
+    Never promote a competition merely because it has many quoted markets.
+    The remaining general slots are filled chronologically. All fixtures are
+    unique, and priority never bypasses the statistical eligibility filters.
+    """
+    uefa = sorted((item for item in games if football_priority(item[1]) == 0), key=lambda item: item[0])
+    top5 = sorted((item for item in games if football_priority(item[1]) == 1), key=lambda item: item[0])
+    other = sorted((item for item in games if football_priority(item[1]) == 2), key=lambda item: item[0])
+
+    # Alternate between the two equal-priority pools, rather than filling UEFA first.
+    preferred = []
+    for i in range(max(len(uefa), len(top5))):
+        if i < len(uefa):
+            preferred.append(uefa[i])
+        if i < len(top5):
+            preferred.append(top5[i])
+    selected = preferred[:FOOTBALL_PRIORITY_RESERVE]
+    selected.extend(other[:FOOTBALL_SCAN_BUDGET - len(selected)])
+    if len(selected) < FOOTBALL_SCAN_BUDGET:
+        selected.extend(preferred[FOOTBALL_PRIORITY_RESERVE:
+                                  FOOTBALL_PRIORITY_RESERVE + FOOTBALL_SCAN_BUDGET - len(selected)])
+    return selected
 
 
 def analyze_batch(max_doubles=3, audit=None):
@@ -310,11 +323,11 @@ def find_double():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🤖 OddX2 3.8-beta online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/weekly - last completed week\n/monthly - last completed month\n/alltime - published track record\n/diagnostics - scan reasons\n/footballaudit - football coverage\n/sports - check basketball and hockey feeds\n/basketball - basketball research preview\n/hockey - hockey research preview\n/multiscan - multisport diagnostic research')
+    await update.message.reply_text('🤖 OddX2 3.9-beta online!\n/status - status\n/fixtures - upcoming fixtures\n/odds - bookmaker odds\n/double - mathematical test\n/analyze - statistical model\n/history - saved doubles\n/stats - results and ROI\n/results - refresh scores\n/scan - scan and publish\n/report - daily report\n/weekly - last completed week\n/monthly - last completed month\n/alltime - published track record\n/diagnostics - scan reasons\n/footballaudit - football coverage\n/sports - check basketball and hockey feeds\n/basketball - basketball research preview\n/hockey - hockey research preview\n/multiscan - multisport diagnostic research')
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('✅ OddX2 3.8-beta is online.')
+    await update.message.reply_text('✅ OddX2 3.9-beta is online.')
 
 
 async def meciuri(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -588,7 +601,7 @@ def settle_pending():
 
 
 async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔎 OddX2 3.1 — Running statistical analysis...')
+    await update.message.reply_text('🔎 OddX2 3.9 — Running statistical analysis...')
     try:
         best, checked, qualified, count = await asyncio.to_thread(analyze)
         if not best:
@@ -599,7 +612,7 @@ async def analiza(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         saved = await asyncio.to_thread(save_double, best)
         x, y, total = best
-        lines = ['🧪 OddX2 3.1 — Poisson model', 'Experimental statistical analysis', '']
+        lines = ['🧪 OddX2 3.9 — Poisson model', 'Experimental statistical analysis', '']
         for i, c in enumerate((x, y), 1):
             lines.extend([
                 f"{i}. {c['home']} vs {c['away']} — {c['kick'].astimezone(LOCAL):%H:%M}",
@@ -885,13 +898,14 @@ async def diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def footballaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔎 OddX2 3.8 | Auditing football coverage (read-only)...')
+    await update.message.reply_text('🔎 OddX2 3.9 | Auditing football coverage (read-only)...')
     try:
         audit = {}
         selected, inspected, qualified, candidates = await asyncio.to_thread(analyze_batch, 1, audit)
         lines = [
-            '⚽ OddX2 3.8 | FOOTBALL COVERAGE AUDIT',
-            f'20h fixtures: {audit["total"]} | prioritized for analysis: {audit["selected"]}',
+            '⚽ OddX2 3.9 | FOOTBALL COVERAGE AUDIT',
+            f'20h fixtures: {audit["total"]} | analysis budget: {FOOTBALL_SCAN_BUDGET} | selected: {audit["selected"]}',
+            f'Equal-priority UEFA/Top 5 reserve: {FOOTBALL_PRIORITY_RESERVE}; remaining slots for other competitions',
             f'Checked: {inspected} | enough history: {qualified} | eligible quotes: {candidates}',
             'Competition | available / selected / checked / history / odds / edge outcomes',
         ]
@@ -1580,7 +1594,7 @@ def main():
                              ('alltime', alltime), ('diagnostics', diagnostics), ('footballaudit', footballaudit),
                              ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview), ('multiscan', multiscan_command), ('backtest', backtest_command), ('marketcheck', marketcheck_command)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('OddX2 3.8-beta started')
+    log.info('OddX2 3.9-beta started')
     app.run_polling()
 
 
