@@ -23,7 +23,7 @@ DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 2
 SCAN_LIMIT_PER_DAY = 16
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "5.1-beta"
+VERSION = "5.2-weekend-test"
 MIN_LEAD_MINUTES = 15
 DAILY_SINGLE_TARGET = 20
 MAX_NEW_SINGLES_PER_SCAN = 5
@@ -2033,6 +2033,119 @@ async def marketcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(message[i:i+3900])
 
 
+
+
+def weekend_research():
+    """Read-only 72h weekend discovery; no existing picks or ROI touched.
+
+    Both branches use actual bookmaker quotes; reverse is a market-disagreement
+    hypothesis, NOT a mathematically proven positive-EV pick.
+    """
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(hours=72)
+    dates = [(now + timedelta(days=i)).date().isoformat() for i in range(4)]
+    fixtures_by_id = {}
+    for day in dates:
+        for game in api('fixtures', {'date': day, 'timezone': 'UTC'}):
+            stamp = (game.get('fixture') or {}).get('date')
+            fid = (game.get('fixture') or {}).get('id')
+            if not stamp or not fid:
+                continue
+            kick = datetime.fromisoformat(stamp.replace('Z', '+00:00')).astimezone(timezone.utc)
+            if now + timedelta(minutes=MIN_LEAD_MINUTES+10) < kick <= end:
+                fixtures_by_id[fid] = (kick, game)
+    selected = prioritize_football_fixtures(sorted(fixtures_by_id.values(), key=lambda v:v[0]))
+    # Avoid excessive requests and long Telegram timeouts: 160 fixture cap.
+    selected = selected[:160]
+    cache, direct, reverse = {}, [], []
+    stats = {'fixtures':len(fixtures_by_id),'checked':0,'history':0,'priced':0,'errors':0}
+    for kick, game in selected:
+        teams = game.get('teams') or {}
+        h, a = teams.get('home') or {}, teams.get('away') or {}
+        if not h.get('id') or not a.get('id'):
+            continue
+        stats['checked'] += 1
+        try:
+            home = [g for g in recent_games(h['id'],cache) if g['venue']=='home'][:10]
+            away = [g for g in recent_games(a['id'],cache) if g['venue']=='away'][:10]
+            if len(home)<5 or len(away)<5:
+                continue
+            stats['history'] += 1
+            prices = odds_for(kick,game)
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            stats['errors'] += 1
+            log.warning('Weekend research skip: %s', exc)
+            continue
+        if not prices:
+            continue
+        stats['priced'] += 1
+        raw_h = (sum(g['for'] for g in home)/len(home)+sum(g['against'] for g in away)/len(away))/2
+        raw_a = (sum(g['for'] for g in away)/len(away)+sum(g['against'] for g in home)/len(home))/2
+        lh = max(.15,min(.8*raw_h+.2*1.40,4.0))
+        la = max(.15,min(.8*raw_a+.2*1.15,4.0))
+        for entry in prices:
+            for book in entry.get('bookmakers',[]):
+                for bet in book.get('bets',[]):
+                    outcomes = {}
+                    for value in bet.get('values',[]):
+                        label = str(value.get('value','')).strip()
+                        market = exact_goal_market(bet.get('id'),label)
+                        if market is None:
+                            continue
+                        try: odd = float(value.get('odd'))
+                        except (ValueError,TypeError): continue
+                        if math.isfinite(odd) and odd>1:
+                            outcomes[(market[0],market[1],market[2])] = (label,odd,market)
+                    for key,(label,odd,market) in outcomes.items():
+                        estimated = goal_probability(market,lh,la)
+                        ev = estimated*odd-1
+                        base = {'fixture':game['fixture']['id'],'home':h.get('name','?'),
+                            'away':a.get('name','?'),'league':league_label(game),
+                            'kick':kick,'bookmaker':book.get('name','?'),
+                            'home_n':len(home),'away_n':len(away)}
+                        if 1.80<=odd<=2.20 and ev>=.05:
+                            direct.append(dict(base,selection=label,odd=odd,model_ev=ev))
+                        if 3.0<=odd<=4.0 and estimated>=.35:
+                            opposite = outcomes.get((market[0],not market[1],market[2]))
+                            if opposite and 1.20<=opposite[1]<=2.20:
+                                # Reverse is tracked as disagreement, not positive model EV.
+                                reverse.append(dict(base,selection=opposite[0],odd=opposite[1],
+                                    original=label,original_odd=odd,model_ev=goal_probability(opposite[2],lh,la)*opposite[1]-1))
+    def unique_ranked(items):
+        by_event={}
+        for item in items:
+            fid=item['fixture']
+            score=(item['model_ev'] if 'original' not in item else item['original_odd']/max(1.01,1/item['model_ev']+1) if item['model_ev']>0 else item['original_odd'])
+            if fid not in by_event or score>by_event[fid][0]:
+                by_event[fid]=(score,item)
+        return [x[1] for x in sorted(by_event.values(),key=lambda x:x[0],reverse=True)]
+    return stats,unique_ranked(direct),unique_ranked(reverse)
+
+
+async def weekendtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🔬 OddX2 | Scanning the next 72 hours for Direct EV and Reverse Signal. Read-only; this may take several minutes.')
+    try:
+        stats,direct,reverse=await asyncio.to_thread(weekend_research)
+        lines=['🔬 OddX2 5.2 | WEEKEND RESEARCH',
+            'READ-ONLY: no posts, bets, database reset or ROI changes.',
+            f'Next 72h: {stats["fixtures"]} fixtures found; {stats["checked"]} checked; '
+            f'{stats["history"]} with enough history; {stats["priced"]} priced; API errors {stats["errors"]}.',
+            f'Direct EV: {len(direct)} distinct matches | Reverse Signal: {len(reverse)} distinct matches.',
+            'DIRECT EV (1.80–2.20; model EV >= +5%, uncalibrated):']
+        for x in direct[:30]:
+            lines.append(f'{x["kick"].astimezone(LOCAL):%d %b %H:%M} | {x["home"]} vs {x["away"]} | {x["selection"]} @ {x["odd"]:.2f} | model EV {x["model_ev"]:+.1%} | {x["bookmaker"]} | samples {x["home_n"]}/{x["away_n"]}')
+        lines.append('REVERSE SIGNAL (observational only; opposite quote actually available):')
+        for x in reverse[:30]:
+            lines.append(f'{x["kick"].astimezone(LOCAL):%d %b %H:%M} | {x["home"]} vs {x["away"]} | {x["selection"]} @ {x["odd"]:.2f} | opposite of {x["original"]} @ {x["original_odd"]:.2f} | {x["bookmaker"]}')
+        lines.append('No implied guarantee. Reverse is not model-positive EV by definition. Prices may change. No backtest or calibrated ROI yet.')
+        text='\n'.join(lines)
+        for i in range(0,len(text),3600):
+            await update.message.reply_text(text[i:i+3600])
+    except Exception:
+        log.exception('Weekend research failed')
+        await update.message.reply_text('Weekend research failed. Check Railway logs. Existing data unchanged.')
+
+
 def main():
     if not TOKEN or not KEY:
         raise RuntimeError('Missing TELEGRAM_BOT_TOKEN or API_FOOTBALL_KEY in Railway')
@@ -2049,9 +2162,9 @@ def main():
                              ('report', value_report_command), ('raport', value_report_command), ('today', value_today_command),
                              ('weekly', value_weekly_command), ('monthly', value_monthly_command),
                              ('alltime', value_report_command), ('diagnostics', diagnostics), ('footballaudit', footballaudit), ('pairaudit', pairaudit),
-                             ('contextaudit', contextaudit_command), ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview), ('multiscan', multiscan_command), ('backtest', backtest_command), ('marketcheck', marketcheck_command)]:
+                             ('contextaudit', contextaudit_command), ('weekendtest', weekendtest_command), ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview), ('multiscan', multiscan_command), ('backtest', backtest_command), ('marketcheck', marketcheck_command)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('OddX2 5.1-beta started')
+    log.info('OddX2 5.2-weekend-test started')
     app.run_polling()
 
 
