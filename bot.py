@@ -23,7 +23,7 @@ DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 2
 SCAN_LIMIT_PER_DAY = 16
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "5.2-weekend-test"
+VERSION = "5.3-direct-ev-public-test"
 MIN_LEAD_MINUTES = 15
 DAILY_SINGLE_TARGET = 20
 MAX_NEW_SINGLES_PER_SCAN = 5
@@ -2035,7 +2035,32 @@ async def marketcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 
-def weekend_research():
+
+
+async def weekendtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🔬 OddX2 | Scanning the next 72 hours for Direct EV and Reverse Signal. Read-only; this may take several minutes.')
+    try:
+        stats,direct,reverse=await asyncio.to_thread(weekend_research)
+        lines=['🔬 OddX2 5.2 | WEEKEND RESEARCH',
+            'READ-ONLY: no posts, bets, database reset or ROI changes.',
+            f'Next 72h: {stats["fixtures"]} fixtures found; {stats["checked"]} checked; '
+            f'{stats["history"]} with enough history; {stats["priced"]} priced; API errors {stats["errors"]}.',
+            f'Direct EV: {len(direct)} distinct matches | Reverse Signal: {len(reverse)} distinct matches.',
+            'DIRECT EV (1.80–2.20; model EV >= +5%, uncalibrated):']
+        for x in direct[:30]:
+            lines.append(f'{x["kick"].astimezone(LOCAL):%d %b %H:%M} | {x["home"]} vs {x["away"]} | {x["selection"]} @ {x["odd"]:.2f} | model EV {x["model_ev"]:+.1%} | {x["bookmaker"]} | samples {x["home_n"]}/{x["away_n"]}')
+        lines.append('REVERSE SIGNAL (observational only; opposite quote actually available):')
+        for x in reverse[:30]:
+            lines.append(f'{x["kick"].astimezone(LOCAL):%d %b %H:%M} | {x["home"]} vs {x["away"]} | {x["selection"]} @ {x["odd"]:.2f} | opposite of {x["original"]} @ {x["original_odd"]:.2f} | {x["bookmaker"]}')
+        lines.append('No implied guarantee. Reverse is not model-positive EV by definition. Prices may change. No backtest or calibrated ROI yet.')
+        text='\n'.join(lines)
+        for i in range(0,len(text),3600):
+            await update.message.reply_text(text[i:i+3600])
+    except Exception:
+        log.exception('Weekend research failed')
+        await update.message.reply_text('Weekend research failed. Check Railway logs. Existing data unchanged.')
+
+def direct_research_53():
     """Read-only 72h weekend discovery; no existing picks or ROI touched.
 
     Both branches use actual bookmaker quotes; reverse is a market-disagreement
@@ -2056,7 +2081,7 @@ def weekend_research():
                 fixtures_by_id[fid] = (kick, game)
     selected = prioritize_football_fixtures(sorted(fixtures_by_id.values(), key=lambda v:v[0]))
     # Avoid excessive requests and long Telegram timeouts: 160 fixture cap.
-    selected = selected[:160]
+    selected = selected[:180]
     cache, direct, reverse = {}, [], []
     stats = {'fixtures':len(fixtures_by_id),'checked':0,'history':0,'priced':0,'errors':0}
     for kick, game in selected:
@@ -2103,9 +2128,9 @@ def weekend_research():
                             'away':a.get('name','?'),'league':league_label(game),
                             'kick':kick,'bookmaker':book.get('name','?'),
                             'home_n':len(home),'away_n':len(away)}
-                        if 1.80<=odd<=2.20 and ev>=.05:
-                            direct.append(dict(base,selection=label,odd=odd,model_ev=ev))
-                        if 3.0<=odd<=4.0 and estimated>=.35:
+                        if 1.50<=odd<=2.20 and ev>=.05 and estimated - 1/odd >= .05:
+                            direct.append(dict(base,selection=label,odd=odd,model_ev=ev,estimated=estimated,implied=1/odd,market=bet.get("name","?"),market_kind=market[0],positive=market[1],threshold=market[2]))
+                        if False:  # Reverse Signal discontinued
                             opposite = outcomes.get((market[0],not market[1],market[2]))
                             if opposite and 1.20<=opposite[1]<=2.20:
                                 # Reverse is tracked as disagreement, not positive model EV.
@@ -2119,31 +2144,334 @@ def weekend_research():
             if fid not in by_event or score>by_event[fid][0]:
                 by_event[fid]=(score,item)
         return [x[1] for x in sorted(by_event.values(),key=lambda x:x[0],reverse=True)]
-    return stats,unique_ranked(direct),unique_ranked(reverse)
+    return stats,unique_ranked(direct)
+
+
+
+# OddX2 5.3: independent public research cohort; historical tables never erased.
+# Every published event is one fixed hypothetical unit. No bets are placed.
+V53_DAILY_CAP = 40
+V53_PER_SCAN_CAP = 15
+V53_SCAN_INTERVAL_HOURS = 3
+V53_MAX_SCANS_DAY = 10
+
+
+def v53_db():
+    con = singles_db()
+    con.execute("""CREATE TABLE IF NOT EXISTS direct_picks_53 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fixture_id INTEGER NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        published_at TEXT,
+        result_posted_at TEXT,
+        kickoff TEXT NOT NULL,
+        league TEXT NOT NULL, home TEXT NOT NULL, away TEXT NOT NULL,
+        bookmaker TEXT NOT NULL, market TEXT NOT NULL, selection TEXT NOT NULL,
+        market_kind TEXT NOT NULL, positive INTEGER NOT NULL, threshold REAL,
+        odd REAL NOT NULL, estimated REAL NOT NULL, implied REAL NOT NULL,
+        estimated_ev REAL NOT NULL, home_n INTEGER NOT NULL, away_n INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        home_goals INTEGER, away_goals INTEGER
+    )""")
+    con.execute("""CREATE TABLE IF NOT EXISTS direct_scans_53 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, scanned_at TEXT NOT NULL,
+        inspected INTEGER NOT NULL, history_ok INTEGER NOT NULL,
+        priced INTEGER NOT NULL, candidates INTEGER NOT NULL,
+        saved INTEGER NOT NULL, status TEXT NOT NULL
+    )""")
+    con.commit()
+    return con
+
+
+def v53_scan():
+    now = datetime.now(timezone.utc)
+    today = now.astimezone(LOCAL).date()
+    with v53_db() as con:
+        runs = con.execute('SELECT scanned_at FROM direct_scans_53').fetchall()
+        saved = con.execute('SELECT created_at FROM direct_picks_53').fetchall()
+        used = {r[0] for r in con.execute('SELECT fixture_id FROM direct_picks_53')}
+    n_runs = sum(datetime.fromisoformat(r[0]).astimezone(LOCAL).date()==today for r in runs)
+    n_saved = sum(datetime.fromisoformat(r[0]).astimezone(LOCAL).date()==today for r in saved)
+    if n_runs >= V53_MAX_SCANS_DAY:
+        return 'Daily scan limit reached (API quota protection).'
+    if n_saved >= V53_DAILY_CAP:
+        return 'Daily research cap reached.'
+    stats, candidates = direct_research_53()
+    count=0
+    with v53_db() as con:
+        for c in candidates:
+            if c['fixture'] in used or count>=min(V53_PER_SCAN_CAP,V53_DAILY_CAP-n_saved):
+                continue
+            # Never publish already started events or odds discovered too late.
+            if c['kick'] <= datetime.now(timezone.utc)+timedelta(minutes=MIN_LEAD_MINUTES+10):
+                continue
+            cur=con.execute("""INSERT OR IGNORE INTO direct_picks_53 (
+                fixture_id,created_at,kickoff,league,home,away,bookmaker,market,
+                selection,market_kind,positive,threshold,odd,estimated,implied,
+                estimated_ev,home_n,away_n)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(
+                c['fixture'],now.isoformat(),c['kick'].isoformat(),c['league'],c['home'],c['away'],
+                c['bookmaker'],c['market'],c['selection'],c['market_kind'],int(c['positive']),
+                c['threshold'],c['odd'],c['estimated'],c['implied'],c['model_ev'],
+                c['home_n'],c['away_n']))
+            count += cur.rowcount
+            if cur.rowcount:
+                used.add(c['fixture'])
+        con.execute('INSERT INTO direct_scans_53 (scanned_at,inspected,history_ok,priced,candidates,saved,status) VALUES (?,?,?,?,?,?,?)',
+                    (now.isoformat(),stats['checked'],stats['history'],stats['priced'],len(candidates),count,'ok'))
+    return f'Saved {count} new selections. Checked {stats["checked"]} fixtures; {stats["priced"]} with odds; {len(candidates)} qualifying events; API errors {stats["errors"]}.'
+
+
+async def v53_publish(app):
+    if not CHANNEL_ID:
+        return 0
+    now=datetime.now(timezone.utc)
+    with v53_db() as con:
+        rows=con.execute("""SELECT id,kickoff,league,home,away,bookmaker,market,
+            selection,odd,estimated,implied,estimated_ev,home_n,away_n
+            FROM direct_picks_53 WHERE published_at IS NULL ORDER BY id""").fetchall()
+    count=0
+    for row in rows:
+        (id_,kick,league,home,away,book,market,selection,odd,estimated,implied,ev,hn,an)=row
+        kickoff=datetime.fromisoformat(kick).astimezone(timezone.utc)
+        if kickoff <= datetime.now(timezone.utc)+timedelta(minutes=MIN_LEAD_MINUTES):
+            continue
+        msg=(f'📊 OddX2 5.3 | DIRECT EV #{id_}\n'
+             f'{home} vs {away}\n{league}\n'
+             f'Kickoff: {kickoff.astimezone(LOCAL):%d %b %Y %H:%M} Bucharest\n'
+             f'{market}: {selection} @ {odd:.2f} | {book}\n'
+             f'Model probability: {estimated:.1%} | Implied: {implied:.1%}\n'
+             f'Model EV (uncalibrated): {ev:+.1%}\n'
+             f'Historical sample: {hn} home / {an} away\n'
+             '⚠️ Experimental statistical research only. Model EV is not proven value; odds may change. No guaranteed returns.')
+        try:
+            await app.bot.send_message(chat_id=CHANNEL_ID,text=msg)
+        except Exception:
+            log.exception('5.3 publish failed for #%s',id_)
+            break
+        with v53_db() as con:
+            con.execute('UPDATE direct_picks_53 SET published_at=? WHERE id=? AND published_at IS NULL',
+                        (datetime.now(timezone.utc).isoformat(),id_))
+        count+=1
+    return count
+
+
+def v53_settle():
+    with v53_db() as con:
+        rows=con.execute("SELECT id,fixture_id,market_kind,positive,threshold FROM direct_picks_53 WHERE status='pending' AND published_at IS NOT NULL").fetchall()
+    changed=0
+    for id_,fixture,kind,positive,threshold in rows:
+        try:
+            games=api('fixtures',{'id':fixture})
+        except Exception:
+            log.exception('5.3 settlement API failed for fixture %s',fixture)
+            continue
+        if not games:
+            continue
+        game=games[0]
+        status=(game.get('fixture') or {}).get('status',{}).get('short')
+        if status in ('CANC','ABD','AWD','WO'):
+            result,hg,ag='void',None,None
+        elif status=='FT':
+            goals=game.get('goals') or {}
+            hg,ag=goals.get('home'),goals.get('away')
+            if not isinstance(hg,int) or not isinstance(ag,int):
+                continue
+            if kind=='goals':
+                hit=((hg+ag)>threshold)==bool(positive)
+            elif kind=='btts':
+                hit=((hg>0 and ag>0)==bool(positive))
+            else:
+                continue
+            result='won' if hit else 'lost'
+        else:
+            # Postponements are left pending until their final status is known.
+            continue
+        with v53_db() as con:
+            con.execute("UPDATE direct_picks_53 SET status=?,home_goals=?,away_goals=? WHERE id=? AND status='pending'",(result,hg,ag,id_))
+        changed+=1
+    return changed
+
+
+async def v53_publish_results(app):
+    if not CHANNEL_ID:
+        return
+    with v53_db() as con:
+        rows=con.execute("""SELECT id,home,away,status,odd,home_goals,away_goals
+            FROM direct_picks_53 WHERE published_at IS NOT NULL AND result_posted_at IS NULL
+            AND status IN ('won','lost','void') ORDER BY id""").fetchall()
+    for id_,home,away,status,odd,hg,ag in rows:
+        pnl=odd-1 if status=='won' else (-1 if status=='lost' else 0)
+        msg=(f'🏁 OddX2 5.3 | RESULT #{id_}\n{home} vs {away}\n'
+             f'Final score: {hg if hg is not None else "-"}-{ag if ag is not None else "-"}\n'
+             f'{status.upper()} | Recorded odds: {odd:.2f}\n'
+             f'Hypothetical 1-unit P/L: {pnl:+.2f} units\n'
+             'Research tracking only. No wagers placed.')
+        try:
+            await app.bot.send_message(chat_id=CHANNEL_ID,text=msg)
+        except Exception:
+            log.exception('5.3 result post failed for #%s',id_)
+            break
+        with v53_db() as con:
+            con.execute('UPDATE direct_picks_53 SET result_posted_at=? WHERE id=? AND result_posted_at IS NULL',
+                        (datetime.now(timezone.utc).isoformat(),id_))
+
+
+def v53_report(period='all'):
+    now=datetime.now(LOCAL)
+    if period=='today':
+        start=now.replace(hour=0,minute=0,second=0,microsecond=0)
+        end=start+timedelta(days=1)
+        label=f'{start:%d %b %Y}'
+    elif period=='week':
+        end=(now-timedelta(days=now.weekday())).replace(hour=0,minute=0,second=0,microsecond=0)
+        start=end-timedelta(days=7)
+        label=f'{start:%d %b}–{(end-timedelta(days=1)):%d %b %Y}'
+    elif period=='month':
+        end=now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
+        start=(end-timedelta(days=1)).replace(day=1)
+        label=f'{start:%B %Y}'
+    else:
+        start=end=None
+        label='All time (5.3 only)'
+    with v53_db() as con:
+        rows=con.execute('SELECT published_at,status,odd,estimated_ev FROM direct_picks_53 WHERE published_at IS NOT NULL').fetchall()
+    if start:
+        rows=[r for r in rows if start<=datetime.fromisoformat(r[0]).astimezone(LOCAL)<end]
+    def line(group,label):
+        wins=sum(r[1]=='won' for r in group)
+        losses=sum(r[1]=='lost' for r in group)
+        voids=sum(r[1]=='void' for r in group)
+        pending=sum(r[1]=='pending' for r in group)
+        settled=wins+losses
+        pnl=sum((r[2]-1 if r[1]=='won' else -1) for r in group if r[1] in ('won','lost'))
+        roi=f'{pnl/settled:+.1%}' if settled else 'N/A'
+        hit=f'{wins/settled:.1%}' if settled else 'N/A'
+        return (f'{label}: {len(group)} published | {wins}W {losses}L {voids}V {pending}P\n'
+                f'  Win rate: {hit} | P/L: {pnl:+.2f}u | ROI: {roi}')
+    lines=['📈 OddX2 5.3 | DIRECT EV PERFORMANCE',f'Period: {label}',line(rows,'TOTAL')]
+    for low,high,label in [(1.50,1.70,'1.50–1.69'),(1.70,1.90,'1.70–1.89'),(1.90,2.201,'1.90–2.20')]:
+        lines.append(line([r for r in rows if low<=r[2]<high],label))
+    lines.append('Published picks only; 1 hypothetical unit per settled pick. Pending/void excluded from ROI. Model EV uncalibrated. Previous strategies excluded.')
+    return '\n'.join(lines)
+
+
+async def value_scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🔎 OddX2 5.3 | Scanning 72h for Direct EV 1.50–2.20. This may take several minutes...')
+    try:
+        result=await asyncio.to_thread(v53_scan)
+        posted=await v53_publish(context.application)
+        await update.message.reply_text(f'{result} Published to channel: {posted}. /report for new-strategy statistics.')
+    except Exception:
+        log.exception('5.3 manual scan failed')
+        await update.message.reply_text('5.3 scan failed; check Railway logs. Historical data preserved.')
+
+
+async def value_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await asyncio.to_thread(v53_report,'all'))
+
+
+async def value_today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await asyncio.to_thread(v53_report,'today'))
+
+
+async def value_weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await asyncio.to_thread(v53_report,'week'))
+
+
+async def value_monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await asyncio.to_thread(v53_report,'month'))
+
+
+async def value_picks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with v53_db() as con:
+        rows=con.execute('SELECT id,home,away,selection,odd,status FROM direct_picks_53 WHERE published_at IS NOT NULL ORDER BY id DESC LIMIT 20').fetchall()
+    msg='📋 OddX2 5.3 | RECENT DIRECT EV\n'+('\n'.join(f'#{i} {h} vs {a} | {sel} @ {odd:.2f} | {st.upper()}' for i,h,a,sel,odd,st in rows) if rows else 'No published selections yet.')
+    await update.message.reply_text(msg[:3900])
 
 
 async def weekendtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔬 OddX2 | Scanning the next 72 hours for Direct EV and Reverse Signal. Read-only; this may take several minutes.')
+    await update.message.reply_text('🔬 Scanning 72h, Direct EV 1.50–2.20 only. Read-only; may take several minutes.')
     try:
-        stats,direct,reverse=await asyncio.to_thread(weekend_research)
-        lines=['🔬 OddX2 5.2 | WEEKEND RESEARCH',
-            'READ-ONLY: no posts, bets, database reset or ROI changes.',
-            f'Next 72h: {stats["fixtures"]} fixtures found; {stats["checked"]} checked; '
-            f'{stats["history"]} with enough history; {stats["priced"]} priced; API errors {stats["errors"]}.',
-            f'Direct EV: {len(direct)} distinct matches | Reverse Signal: {len(reverse)} distinct matches.',
-            'DIRECT EV (1.80–2.20; model EV >= +5%, uncalibrated):']
-        for x in direct[:30]:
-            lines.append(f'{x["kick"].astimezone(LOCAL):%d %b %H:%M} | {x["home"]} vs {x["away"]} | {x["selection"]} @ {x["odd"]:.2f} | model EV {x["model_ev"]:+.1%} | {x["bookmaker"]} | samples {x["home_n"]}/{x["away_n"]}')
-        lines.append('REVERSE SIGNAL (observational only; opposite quote actually available):')
-        for x in reverse[:30]:
-            lines.append(f'{x["kick"].astimezone(LOCAL):%d %b %H:%M} | {x["home"]} vs {x["away"]} | {x["selection"]} @ {x["odd"]:.2f} | opposite of {x["original"]} @ {x["original_odd"]:.2f} | {x["bookmaker"]}')
-        lines.append('No implied guarantee. Reverse is not model-positive EV by definition. Prices may change. No backtest or calibrated ROI yet.')
-        text='\n'.join(lines)
-        for i in range(0,len(text),3600):
-            await update.message.reply_text(text[i:i+3600])
+        stats,picks=await asyncio.to_thread(direct_research_53)
+        lines=[f'OddX2 5.3 | DIRECT RESEARCH: {stats["fixtures"]} fixtures, {stats["checked"]} checked, {stats["priced"]} priced, {len(picks)} qualifying; errors {stats["errors"]}.']
+        for x in picks[:40]:
+            lines.append(f'{x["kick"].astimezone(LOCAL):%d %b %H:%M} | {x["home"]} vs {x["away"]} | {x["selection"]} @ {x["odd"]:.2f} | model EV {x["model_ev"]:+.1%}')
+        msg='\n'.join(lines)
+        for i in range(0,len(msg),3500):
+            await update.message.reply_text(msg[i:i+3500])
     except Exception:
-        log.exception('Weekend research failed')
-        await update.message.reply_text('Weekend research failed. Check Railway logs. Existing data unchanged.')
+        log.exception('5.3 weekend test failed')
+        await update.message.reply_text('Weekend research failed. See Railway logs.')
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('✅ OddX2 5.3 | Direct EV public research active. Odds 1.50–2.20. New independent ROI cohort. /scan /picks /report /today /weekly /monthly /weekendtest')
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await status(update,context)
+
+
+async def periodic_scanning(app):
+    await asyncio.sleep(300)
+    while True:
+        try:
+            state=await asyncio.to_thread(v53_scan)
+            posted=await v53_publish(app)
+            log.info('5.3 auto scan: %s; published=%s',state,posted)
+        except Exception:
+            log.exception('5.3 automatic scan failed')
+        await asyncio.sleep(V53_SCAN_INTERVAL_HOURS*3600)
+
+
+async def periodic_settlement(app):
+    while True:
+        await asyncio.sleep(1800)
+        try:
+            await asyncio.to_thread(v53_settle)
+            await v53_publish_results(app)
+            # Old records remain intact, but old results are not republished.
+        except Exception:
+            log.exception('5.3 settlement failed')
+
+
+async def scheduled_reports(app):
+    while True:
+        try:
+            now=datetime.now(LOCAL)
+            if CHANNEL_ID and now.hour>=23:
+                key=now.strftime('%Y-%m-%d')
+                with db_connect() as con:
+                    already=con.execute('SELECT 1 FROM report_posts WHERE period_type=? AND period_key=?',('v53_daily',key)).fetchone()
+                if not already:
+                    await app.bot.send_message(chat_id=CHANNEL_ID,text=await asyncio.to_thread(v53_report,'today'))
+                    with db_connect() as con:
+                        con.execute('INSERT OR IGNORE INTO report_posts(period_type,period_key,sent_at) VALUES(?,?,?)',
+                                    ('v53_daily',key,datetime.now(timezone.utc).isoformat()))
+            if CHANNEL_ID and now.hour>=9:
+                for kind,due in [('week',now.weekday()==0),('month',now.day==1)]:
+                    if not due: continue
+                    key=((now-timedelta(days=7)).strftime('%G-W%V') if kind=='week' else (now.replace(day=1)-timedelta(days=1)).strftime('%Y-%m'))
+                    with db_connect() as con:
+                        already=con.execute('SELECT 1 FROM report_posts WHERE period_type=? AND period_key=?',('v53_'+kind,key)).fetchone()
+                    if not already:
+                        await app.bot.send_message(chat_id=CHANNEL_ID,text=await asyncio.to_thread(v53_report,kind))
+                        with db_connect() as con:
+                            con.execute('INSERT OR IGNORE INTO report_posts(period_type,period_key,sent_at) VALUES(?,?,?)',
+                                        ('v53_'+kind,key,datetime.now(timezone.utc).isoformat()))
+        except Exception:
+            log.exception('5.3 scheduled report failed')
+        await asyncio.sleep(3600)
+
+
+async def on_startup(app):
+    await asyncio.to_thread(lambda: v53_db().close())
+    app.create_task(periodic_settlement(app))
+    app.create_task(periodic_scanning(app))
+    app.create_task(scheduled_reports(app))
+    app.create_task(periodic_sport_observations(app))
+    await v53_publish(app)
 
 
 def main():
@@ -2164,7 +2492,7 @@ def main():
                              ('alltime', value_report_command), ('diagnostics', diagnostics), ('footballaudit', footballaudit), ('pairaudit', pairaudit),
                              ('contextaudit', contextaudit_command), ('weekendtest', weekendtest_command), ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview), ('multiscan', multiscan_command), ('backtest', backtest_command), ('marketcheck', marketcheck_command)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('OddX2 5.2-weekend-test started')
+    log.info('OddX2 5.3-direct-ev-public-test started')
     app.run_polling()
 
 
