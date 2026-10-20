@@ -14,6 +14,8 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger('odds-copilot')
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 KEY = os.getenv('API_FOOTBALL_KEY')
@@ -23,7 +25,7 @@ DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 2
 SCAN_LIMIT_PER_DAY = 16
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "5.3-direct-ev-public-test"
+VERSION = "5.4-direct-ev-diagnostics"
 MIN_LEAD_MINUTES = 15
 DAILY_SINGLE_TARGET = 20
 MAX_NEW_SINGLES_PER_SCAN = 5
@@ -801,6 +803,117 @@ def value_report(period='all'):
             f'Void: {voids} | Pending: {pending}\nROI: N/A') + (
             '\nPublished picks only; fixed hypothetical 1-unit stakes. '
             'No actual bets. Legacy doubles excluded. Historical periods update as picks settle.')
+
+
+
+
+# OddX2 5.4: diagnostic-only calibration. Same 5.3 cohort and publication rules.
+# All reported ROI uses actual published selections, one hypothetical unit each.
+def v54_diagnostic_rows():
+    with v53_db() as con:
+        return con.execute("""SELECT id,published_at,kickoff,league,bookmaker,market,
+            selection,market_kind,positive,threshold,odd,estimated,implied,
+            estimated_ev,home_n,away_n,status,home_goals,away_goals,created_at
+            FROM direct_picks_53 WHERE published_at IS NOT NULL ORDER BY id""").fetchall()
+
+
+def v54_summary(rows, name):
+    w=sum(r[16]=='won' for r in rows)
+    l=sum(r[16]=='lost' for r in rows)
+    v=sum(r[16]=='void' for r in rows)
+    p=sum(r[16]=='pending' for r in rows)
+    n=w+l
+    profit=sum((r[10]-1 if r[16]=='won' else -1) for r in rows if r[16] in ('won','lost'))
+    avg_odd=sum(r[10] for r in rows if r[16] in ('won','lost'))/n if n else 0
+    roi=f'{profit/n:+.1%}' if n else 'N/A'
+    hit=f'{w/n:.1%}' if n else 'N/A'
+    return f'{name}: {len(rows)} picks | {w}W {l}L {v}V {p}P | hit {hit} | avg odds {avg_odd:.2f} | P/L {profit:+.2f}u | ROI {roi}'
+
+
+def v54_market_report():
+    rows=v54_diagnostic_rows()
+    def category(r):
+        if r[7]=='btts':
+            return 'BTTS Yes' if r[8] else 'BTTS No'
+        if r[7]=='goals':
+            direction='Over' if r[8] else 'Under'
+            return f'{direction} {r[9]:g}' if r[9] is not None else direction
+        return str(r[5])
+    groups={}
+    for r in rows:
+        groups.setdefault(category(r),[]).append(r)
+    lines=['📊 OddX2 5.4 | MARKET PERFORMANCE',
+           'Same historical 5.3 published cohort; no reset.',
+           v54_summary(rows,'ALL MARKETS'),'— By selection —']
+    for name,group in sorted(groups.items(),key=lambda x:(-len(x[1]),x[0])):
+        lines.append(v54_summary(group,name))
+    lines.extend(['— By market family —'])
+    for kind,label in [('goals','Total goals'),('btts','Both teams to score')]:
+        lines.append(v54_summary([r for r in rows if r[7]==kind],label))
+    lines.append('Small samples are noisy. Model EV remains uncalibrated. ROI is hypothetical, not guaranteed.')
+    return '\n'.join(lines)
+
+
+def v54_quality_report():
+    rows=v54_diagnostic_rows()
+    lines=['🔎 OddX2 5.4 | QUALITY & CALIBRATION',
+           'Based only on selections published before kickoff.',
+           v54_summary(rows,'ALL')]
+    groups=[('Sample min 5–6',[r for r in rows if min(r[14],r[15])<=6]),
+            ('Sample min 7–8',[r for r in rows if 7<=min(r[14],r[15])<=8]),
+            ('Sample min 9+',[r for r in rows if min(r[14],r[15])>=9]),
+            ('Model EV 5–14.9%',[r for r in rows if .05<=r[13]<.15]),
+            ('Model EV 15–29.9%',[r for r in rows if .15<=r[13]<.30]),
+            ('Model EV 30%+',[r for r in rows if r[13]>=.30])]
+    for label,group in groups:
+        lines.append(v54_summary(group,label))
+    settled=[r for r in rows if r[16] in ('won','lost')]
+    if settled:
+        predicted=sum(r[11] for r in settled)/len(settled)
+        actual=sum(r[16]=='won' for r in settled)/len(settled)
+        brier=sum((r[11]-(1 if r[16]=='won' else 0))**2 for r in settled)/len(settled)
+        lines.extend([f'Calibration on settled: model mean {predicted:.1%} vs actual {actual:.1%}',
+                      f'Brier score: {brier:.3f} (lower is better; not a validated backtest).'])
+    lines.append('Warning: cohort is selected by model EV, not an independent validation sample.')
+    return '\n'.join(lines)
+
+
+def v54_league_report():
+    rows=v54_diagnostic_rows()
+    groups={}
+    for r in rows:
+        groups.setdefault(r[3],[]).append(r)
+    ranked=sorted(groups.items(),key=lambda item:(-sum(r[16] in ('won','lost') for r in item[1]),-len(item[1])))
+    lines=['🌍 OddX2 5.4 | LEAGUE PERFORMANCE',v54_summary(rows,'ALL'),
+           'Top 20 leagues by number of settled picks:']
+    for name,group in ranked[:20]:
+        lines.append(v54_summary(group,str(name)[:45]))
+    lines.append('League comparisons are descriptive; no automatic exclusion based on tiny samples.')
+    return '\n'.join(lines)
+
+
+async def v54_reply_long(update, text):
+    # Split only on line boundaries to keep Telegram readable.
+    part=''
+    for line in text.split('\n'):
+        if len(part)+len(line)+1>3700:
+            await update.message.reply_text(part)
+            part=''
+        part+=line+'\n'
+    if part:
+        await update.message.reply_text(part)
+
+
+async def v54_market_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await v54_reply_long(update,await asyncio.to_thread(v54_market_report))
+
+
+async def v54_quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await v54_reply_long(update,await asyncio.to_thread(v54_quality_report))
+
+
+async def v54_league_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await v54_reply_long(update,await asyncio.to_thread(v54_league_report))
 
 
 async def value_scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2406,7 +2519,7 @@ async def weekendtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('✅ OddX2 5.3 | Direct EV public research active. Odds 1.50–2.20. New independent ROI cohort. /scan /picks /report /today /weekly /monthly /weekendtest')
+    await update.message.reply_text('✅ OddX2 5.4 | Direct EV research active. Odds 1.50–2.20. Continuing 5.3 ROI cohort (no reset). /scan /picks /report /markets /quality /leagues /today /weekly /monthly')
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2489,10 +2602,10 @@ def main():
                              ('scan', value_scan_command), ('scanare', value_scan_command),
                              ('report', value_report_command), ('raport', value_report_command), ('today', value_today_command),
                              ('weekly', value_weekly_command), ('monthly', value_monthly_command),
-                             ('alltime', value_report_command), ('diagnostics', diagnostics), ('footballaudit', footballaudit), ('pairaudit', pairaudit),
+                             ('alltime', value_report_command), ('markets', v54_market_command), ('quality', v54_quality_command), ('leagues', v54_league_command), ('diagnostics', diagnostics), ('footballaudit', footballaudit), ('pairaudit', pairaudit),
                              ('contextaudit', contextaudit_command), ('weekendtest', weekendtest_command), ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview), ('multiscan', multiscan_command), ('backtest', backtest_command), ('marketcheck', marketcheck_command)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('OddX2 5.3-direct-ev-public-test started')
+    log.info('OddX2 5.4-direct-ev-diagnostics started')
     app.run_polling()
 
 
