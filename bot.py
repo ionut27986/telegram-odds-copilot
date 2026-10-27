@@ -26,7 +26,7 @@ DB_PATH = Path(os.getenv('ODDS_DB_PATH', '/data/odds_copilot.sqlite3'))
 AUTO_SCAN_HOURS = 2
 SCAN_LIMIT_PER_DAY = 16
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-VERSION = "5.5-prospective-direct-ev"
+VERSION = "5.6-under-shadow-observations"
 MIN_LEAD_MINUTES = 15
 DAILY_SINGLE_TARGET = 20
 MAX_NEW_SINGLES_PER_SCAN = 5
@@ -2352,20 +2352,112 @@ async def v53_publish_results(app):
 
 
 
-# v5.5 prospective filter. This is an experimental hypothesis, not validated value.
+# v5.6 publication filter; historical 5.5 tables remain unchanged.
 def v55_rejection(c):
+    # Under is observation-only, including quotes outside the publication EV band.
+    if c['market_kind']=='goals' and c['selection'].strip().lower().startswith('under '):
+        return 'under_holdout_56'
     if not (1.50 <= c['odd'] <= 2.20): return 'odds'
     ev=c['model_ev']
     if not (.15 <= ev < .30): return 'ev_outside_15_30'
     if c['market_kind']=='goals':
-        if c['selection'].strip().lower() == 'under 3.5': return 'under_3_5_holdout'
         # Other poorly sampled lines remain observable, not published.
-        if c['selection'].strip().lower() not in ('over 2.5','under 2.5'):
+        if c['selection'].strip().lower() != 'over 2.5':
             return 'other_goal_line_holdout'
     elif c['market_kind']=='btts':
         if c['selection'].strip().lower() != 'yes': return 'btts_no_holdout'
     else: return 'unsupported_market'
     return None
+
+# Dedicated v5.6 shadow ledger: one record per fixture/market/selection.
+# The 5.5 observations table has fixture_id as PRIMARY KEY and cannot hold
+# multiple markets for the same fixture. Do not migrate or overwrite it.
+def v56_observation_db():
+    con = v55_db()
+    con.execute("""CREATE TABLE IF NOT EXISTS direct_observations_56 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fixture_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        kickoff TEXT NOT NULL,
+        league TEXT, home TEXT, away TEXT,
+        bookmaker TEXT, market TEXT, selection TEXT NOT NULL,
+        odd REAL NOT NULL, estimated REAL, implied REAL,
+        estimated_ev REAL, reason TEXT NOT NULL,
+        market_kind TEXT NOT NULL, positive INTEGER NOT NULL,
+        threshold REAL, home_n INTEGER, away_n INTEGER,
+        status TEXT NOT NULL DEFAULT 'pending',
+        home_goals INTEGER, away_goals INTEGER,
+        UNIQUE(fixture_id, market_kind, selection)
+    )""")
+    con.commit()
+    return con
+
+
+def v56_record_under(candidates, now):
+    # Record one pre-match quote per event and selection, not each bookmaker quote.
+    # Choose highest available odd, without using future match outcomes.
+    best = {}
+    for c in candidates:
+        if v55_rejection(c) != 'under_holdout_56':
+            continue
+        if c['kick'] <= now + timedelta(minutes=MIN_LEAD_MINUTES):
+            continue
+        key = (c['fixture'], c['market_kind'], c['selection'].strip().lower())
+        if key not in best or c['odd'] > best[key]['odd']:
+            best[key] = c
+    with v56_observation_db() as con:
+        for c in best.values():
+            con.execute("""INSERT OR IGNORE INTO direct_observations_56
+                (fixture_id,created_at,kickoff,league,home,away,bookmaker,market,
+                 selection,odd,estimated,implied,estimated_ev,reason,market_kind,
+                 positive,threshold,home_n,away_n)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (c['fixture'],now.isoformat(),c['kick'].isoformat(),c['league'],
+                 c['home'],c['away'],c['bookmaker'],c['market'],c['selection'],
+                 c['odd'],c['estimated'],c['implied'],c['model_ev'],
+                 'under_holdout_56',c['market_kind'],int(c['positive']),
+                 c['threshold'],c['home_n'],c['away_n']))
+    return len(best)
+
+
+def v56_settle_observations():
+    with v56_observation_db() as con:
+        rows = con.execute("""SELECT id,fixture_id,market_kind,positive,threshold
+            FROM direct_observations_56
+            WHERE status='pending' AND kickoff < ? LIMIT 30""",
+            (datetime.now(timezone.utc).isoformat(),)).fetchall()
+    cache = {}
+    for id_, fid, kind, positive, threshold in rows:
+        if fid not in cache:
+            try:
+                games = api('fixtures', {'id':fid})
+                cache[fid] = games[0] if games else None
+            except Exception:
+                log.exception('5.6 shadow settlement lookup failed: %s',fid)
+                cache[fid] = None
+        game = cache[fid]
+        if not game:
+            continue
+        state = (game.get('fixture') or {}).get('status',{}).get('short')
+        hg = (game.get('goals') or {}).get('home')
+        ag = (game.get('goals') or {}).get('away')
+        if state in ('CANC','ABD','AWD','WO'):
+            result, hg, ag = 'void', None, None
+        elif state == 'FT' and isinstance(hg,int) and isinstance(ag,int):
+            if kind == 'goals':
+                hit = ((hg+ag)>threshold) == bool(positive)
+            elif kind == 'btts':
+                hit = ((hg>0 and ag>0) == bool(positive))
+            else:
+                continue
+            result = 'won' if hit else 'lost'
+        else:
+            continue
+        with v56_observation_db() as con:
+            con.execute("""UPDATE direct_observations_56
+                SET status=?,home_goals=?,away_goals=?
+                WHERE id=? AND status='pending'""",(result,hg,ag,id_))
+
 
 def v55_settle_observations():
     with v55_db() as con:
@@ -2401,12 +2493,19 @@ async def v55_observations_command(update,context):
             threshold REAL, status TEXT NOT NULL DEFAULT 'pending',
             home_goals INTEGER, away_goals INTEGER)""")
         rows=con.execute('SELECT reason,status,odd FROM direct_observations_55').fetchall()
-    lines=['🔬 OddX2 5.5 | OBSERVATION-ONLY HOLDOUTS']
+    lines=['🔬 OddPlus 5.6 | OBSERVATION-ONLY HOLDOUTS']
     for reason in sorted(set(r[0] for r in rows)):
         subset=[r for r in rows if r[0]==reason]
         w=sum(r[1]=='won' for r in subset); l=sum(r[1]=='lost' for r in subset)
         pnl=sum((r[2]-1 if r[1]=='won' else -1) for r in subset if r[1] in ('won','lost'))
         lines.append(f'{reason}: {len(subset)} observed | {w}W {l}L | ROI {pnl/(w+l):+.1%}' if w+l else f'{reason}: {len(subset)} observed | pending')
+    with v56_observation_db() as con:
+        shadow=con.execute('SELECT selection,status,odd FROM direct_observations_56').fetchall()
+    for selection in sorted(set(r[0] for r in shadow)):
+        subset=[r for r in shadow if r[0]==selection]
+        w=sum(r[1]=='won' for r in subset); l=sum(r[1]=='lost' for r in subset)
+        pnl=sum((r[2]-1 if r[1]=='won' else -1) for r in subset if r[1] in ('won','lost'))
+        lines.append(f'v5.6 shadow {selection}: {len(subset)} | {w}W {l}L | ROI {pnl/(w+l):+.1%}' if w+l else f'v5.6 shadow {selection}: {len(subset)} | pending')
     lines.append('Observations are never published as picks. Prospective comparison only.')
     await update.message.reply_text('\n'.join(lines)[:3900])
 
@@ -2460,6 +2559,7 @@ def v55_scan():
     if n_saved >= V55_DAILY_CAP:
         return 'Daily research cap reached.'
     stats, candidates = direct_research_53()
+    v56_record_under(candidates, now)
     # Prospectively record excluded candidates to test the filter, never retroactively.
     with v55_db() as con:
         con.execute('''CREATE TABLE IF NOT EXISTS direct_observations_55 (
@@ -2470,7 +2570,7 @@ def v55_scan():
             home_goals INTEGER, away_goals INTEGER)''')
         for c in candidates:
             reason=v55_rejection(c)
-            if reason:
+            if reason and reason != 'under_holdout_56':
                 con.execute('''INSERT OR IGNORE INTO direct_observations_55
                     (fixture_id,created_at,kickoff,league,home,away,selection,odd,estimated_ev,
                     reason,market_kind,positive,threshold) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
@@ -2500,7 +2600,7 @@ def v55_scan():
                 used.add(c['fixture'])
         con.execute('INSERT INTO direct_scans_55 (scanned_at,inspected,history_ok,priced,candidates,saved,status) VALUES (?,?,?,?,?,?,?)',
                     (now.isoformat(),stats['checked'],stats['history'],stats['priced'],len(candidates),count,'ok'))
-    return f'Saved {count} new 5.5 selections. Checked {stats["checked"]} fixtures; {stats["priced"]} with odds; {len(candidates)} qualifying events; API errors {stats["errors"]}.'
+    return f'Saved {count} new 5.6 selections. Checked {stats["checked"]} fixtures; {stats["priced"]} with odds; {len(candidates)} qualifying events; API errors {stats["errors"]}.'
 
 
 async def v55_publish(app):
@@ -2514,10 +2614,13 @@ async def v55_publish(app):
     count=0
     for row in rows:
         (id_,kick,league,home,away,book,market,selection,odd,estimated,implied,ev,hn,an)=row
+        # Protect against Under picks queued by 5.5 before deployment.
+        if selection.strip().lower().startswith('under '):
+            continue
         kickoff=datetime.fromisoformat(kick).astimezone(timezone.utc)
         if kickoff <= datetime.now(timezone.utc)+timedelta(minutes=MIN_LEAD_MINUTES):
             continue
-        msg=(f'📊 OddX2 5.5 | DIRECT EV #{id_}\n'
+        msg=(f'📊 OddPlus 5.6 | DIRECT EV #{id_}\n'
              f'{home} vs {away}\n{league}\n'
              f'Kickoff: {kickoff.astimezone(LOCAL):%d %b %Y %H:%M} Bucharest\n'
              f'{market}: {selection} @ {odd:.2f} | {book}\n'
@@ -2713,6 +2816,7 @@ async def periodic_settlement(app):
             await asyncio.to_thread(v53_settle)
             await asyncio.to_thread(v55_settle)
             await asyncio.to_thread(v55_settle_observations)
+            await asyncio.to_thread(v56_settle_observations)
             await v53_publish_results(app)
             await v55_publish_results(app)
             # Old records remain intact, but old results are not republished.
@@ -2751,6 +2855,7 @@ async def scheduled_reports(app):
 
 async def on_startup(app):
     await asyncio.to_thread(lambda: v55_db().close())
+    await asyncio.to_thread(lambda: v56_observation_db().close())
     app.create_task(periodic_settlement(app))
     app.create_task(periodic_scanning(app))
     app.create_task(scheduled_reports(app))
@@ -2776,7 +2881,7 @@ def main():
                              ('observations', v55_observations_command), ('alltime', value_report_command), ('markets', v54_market_command), ('quality', v54_quality_command), ('leagues', v54_league_command), ('diagnostics', diagnostics), ('footballaudit', footballaudit), ('pairaudit', pairaudit),
                              ('contextaudit', contextaudit_command), ('weekendtest', weekendtest_command), ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview), ('multiscan', multiscan_command), ('backtest', backtest_command), ('marketcheck', marketcheck_command)]:
         app.add_handler(CommandHandler(command, handler))
-    log.info('OddX2 5.5-prospective-direct-ev started')
+    log.info('OddPlus 5.6-under-shadow-observations started')
     app.run_polling()
 
 
