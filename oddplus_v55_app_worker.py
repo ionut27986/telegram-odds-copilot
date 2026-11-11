@@ -8,7 +8,7 @@ from urllib.request import Request, urlopen
 
 from bot import (
     MIN_LEAD_MINUTES, V55_SCAN_INTERVAL_HOURS,
-    v55_db, v55_scan, v55_settle,
+    v53_db, v55_db, v55_scan, v55_settle,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -71,6 +71,9 @@ def sync_to_api():
 def main():
     if not os.getenv("API_FOOTBALL_KEY"):
         raise RuntimeError("API_FOOTBALL_KEY missing")
+    # v5.5 reads the v5.3 fixture ledger to avoid duplicates; initialize it empty.
+    with v53_db():
+        pass
     with v55_db():
         pass
     next_scan = time.monotonic() + 30
