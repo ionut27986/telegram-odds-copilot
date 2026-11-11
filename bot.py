@@ -2538,39 +2538,63 @@ async def v55_publish(app):
 
 
 def v55_settle():
+    """Settle published picks efficiently; never query games before likely full-time."""
+    now = datetime.now(timezone.utc)
     with v55_db() as con:
-        rows=con.execute("SELECT id,fixture_id,market_kind,positive,threshold FROM direct_picks_55 WHERE status='pending' AND published_at IS NOT NULL").fetchall()
-    changed=0
-    for id_,fixture,kind,positive,threshold in rows:
+        rows = con.execute(
+            "SELECT id,fixture_id,market_kind,positive,threshold,kickoff "
+            "FROM direct_picks_55 WHERE status='pending' AND published_at IS NOT NULL"
+        ).fetchall()
+    changed = 0
+    fixture_cache = {}
+    for id_, fixture, kind, positive, threshold, kickoff in rows:
         try:
-            games=api('fixtures',{'id':fixture})
-        except Exception:
-            log.exception('5.5 settlement API failed for fixture %s',fixture)
+            kick = datetime.fromisoformat(str(kickoff).replace("Z", "+00:00"))
+            if kick.tzinfo is None:
+                kick = kick.replace(tzinfo=timezone.utc)
+            # Avoid wasting requests on matches that cannot have finished.
+            if kick + timedelta(hours=2, minutes=15) > now:
+                continue
+        except (ValueError, TypeError):
+            log.warning("Invalid kickoff for pick %s; skipping settlement", id_)
             continue
+        if fixture not in fixture_cache:
+            try:
+                fixture_cache[fixture] = api('fixtures', {'id': fixture})
+            except Exception as exc:
+                if 'request limit' in str(exc).lower():
+                    log.warning("API-Football daily quota exhausted; stop settlement until next run")
+                    break
+                log.exception('5.5 settlement API failed for fixture %s', fixture)
+                fixture_cache[fixture] = []
+        games = fixture_cache[fixture]
         if not games:
             continue
-        game=games[0]
-        status=(game.get('fixture') or {}).get('status',{}).get('short')
-        if status in ('CANC','ABD','AWD','WO'):
-            result,hg,ag='void',None,None
-        elif status=='FT':
-            goals=game.get('goals') or {}
-            hg,ag=goals.get('home'),goals.get('away')
-            if not isinstance(hg,int) or not isinstance(ag,int):
+        game = games[0]
+        status = (game.get('fixture') or {}).get('status', {}).get('short')
+        if status in ('CANC', 'ABD', 'AWD', 'WO'):
+            result, hg, ag = 'void', None, None
+        elif status == 'FT':
+            goals = game.get('goals') or {}
+            hg, ag = goals.get('home'), goals.get('away')
+            if not isinstance(hg, int) or not isinstance(ag, int):
                 continue
-            if kind=='goals':
-                hit=((hg+ag)>threshold)==bool(positive)
-            elif kind=='btts':
-                hit=((hg>0 and ag>0)==bool(positive))
+            if kind == 'goals':
+                hit = ((hg + ag) > threshold) == bool(positive)
+            elif kind == 'btts':
+                hit = ((hg > 0 and ag > 0) == bool(positive))
             else:
                 continue
-            result='won' if hit else 'lost'
+            result = 'won' if hit else 'lost'
         else:
-            # Postponements are left pending until their final status is known.
             continue
         with v55_db() as con:
-            con.execute("UPDATE direct_picks_55 SET status=?,home_goals=?,away_goals=? WHERE id=? AND status='pending'",(result,hg,ag,id_))
-        changed+=1
+            con.execute(
+                "UPDATE direct_picks_55 SET status=?,home_goals=?,away_goals=? "
+                "WHERE id=? AND status='pending'",
+                (result, hg, ag, id_)
+            )
+        changed += 1
     return changed
 
 
