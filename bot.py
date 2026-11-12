@@ -2358,9 +2358,9 @@ def v55_rejection(c):
     ev=c['model_ev']
     if not (.15 <= ev < .30): return 'ev_outside_15_30'
     if c['market_kind']=='goals':
-        if c['selection'].strip().lower() == 'under 3.5': return 'under_3_5_holdout'
+        if c['selection'].strip().lower().startswith('under '): return 'under_holdout'
         # Other poorly sampled lines remain observable, not published.
-        if c['selection'].strip().lower() not in ('over 2.5','under 2.5'):
+        if c['selection'].strip().lower() not in ('over 2.5',):
             return 'other_goal_line_holdout'
     elif c['market_kind']=='btts':
         if c['selection'].strip().lower() != 'yes': return 'btts_no_holdout'
