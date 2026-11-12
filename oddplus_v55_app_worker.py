@@ -93,6 +93,38 @@ def settlement_summary():
     return f"Published ledger: {finished} settled, {pending} pending, {due} due for result check"
 
 
+def sync_telegram_v55():
+    """Import published v5.5 picks from Telegram's read-only internal API.
+
+    Do not alter Telegram's database or accept data from other model versions.
+    """
+    source = os.getenv("ODDPLUS_TELEGRAM_V55_URL",
+                       "http://telegram-odds-copilot.railway.internal:8090/internal/picks")
+    request = Request(source, headers={"X-Internal-Token": SYNC_TOKEN})
+    with urlopen(request, timeout=20) as response:
+        data = json.load(response)
+    if data.get("version") != "5.5":
+        raise RuntimeError("Telegram source is not v5.5")
+    picks = data.get("picks", [])
+    if not picks:
+        log.warning("Telegram v5.5 source returned no published picks; keeping existing ledger")
+        return False
+    if not SYNC_URL or not SYNC_TOKEN:
+        raise RuntimeError("OddPlus sync configuration missing")
+    payload = json.dumps({"version": "5.5", "picks": picks}).encode("utf-8")
+    target = Request(SYNC_URL, data=payload, method="POST",
+                     headers={"Content-Type": "application/json",
+                              "X-Internal-Token": SYNC_TOKEN})
+    with urlopen(target, timeout=20) as response:
+        result = json.load(response)
+    if result.get("status") != "ok":
+        raise RuntimeError("OddPlus API rejected Telegram sync")
+    settled = sum(str(p.get("status", "")).lower() in ("won", "lost") for p in picks)
+    log.info("Telegram v5.5 bridge: %s published, %s WIN/LOSS; synced %s",
+             len(picks), settled, result.get("received"))
+    return True
+
+
 def main():
     if not os.getenv("API_FOOTBALL_KEY"):
         raise RuntimeError("API_FOOTBALL_KEY missing")
@@ -102,11 +134,19 @@ def main():
     with v55_db():
         pass
     next_scan = time.monotonic() + 30
+    telegram_bridge_active = False
+    next_bridge = time.monotonic()
     next_settle = time.monotonic() + 1800
     next_sync = time.monotonic() + 10
     while True:
         now = time.monotonic()
-        if now >= next_scan:
+        if now >= next_bridge:
+            try:
+                telegram_bridge_active = sync_telegram_v55()
+            except Exception:
+                log.exception("Telegram v5.5 bridge failed; existing ledger preserved")
+            next_bridge = time.monotonic() + 300
+        if not telegram_bridge_active and now >= next_scan:
             try:
                 log.info("%s", v55_scan())
                 log.info("Published %s", publish_to_ledger())
@@ -114,7 +154,7 @@ def main():
                 log.exception("v5.5 scan failed")
             next_scan = time.monotonic() + max(1, V55_SCAN_INTERVAL_HOURS) * 3600
             next_sync = time.monotonic()
-        if now >= next_settle:
+        if not telegram_bridge_active and now >= next_settle:
             try:
                 log.info("Settled %s", v55_settle())
                 log.info("%s", settlement_summary())
@@ -122,7 +162,7 @@ def main():
                 log.exception("v5.5 settlement failed")
             next_settle = time.monotonic() + 1800
             next_sync = time.monotonic()
-        if now >= next_sync:
+        if not telegram_bridge_active and now >= next_sync:
             try:
                 sync_to_api()
             except Exception:
