@@ -160,7 +160,7 @@ def main():
                 log.exception("v5.5 scan failed")
             next_scan = time.monotonic() + max(1, V55_SCAN_INTERVAL_HOURS) * 3600
             next_sync = time.monotonic()
-        if not telegram_bridge_active and now >= next_settle:
+        if os.getenv('ODDPLUS_SETTLE_OLD_PICKS', '0') == '1' and not telegram_bridge_active and now >= next_settle:
             try:
                 log.info("Settled %s", v55_settle())
                 log.info("%s", settlement_summary())
