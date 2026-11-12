@@ -68,6 +68,31 @@ def sync_to_api():
     log.info("Synced %s v5.5 picks", result.get("received"))
 
 
+def settlement_summary():
+    """Operational counts only; never alter the independent app ledger."""
+    now = datetime.now(timezone.utc)
+    with v55_db() as db:
+        rows = db.execute(
+            "SELECT status,kickoff FROM direct_picks_55 "
+            "WHERE published_at IS NOT NULL"
+        ).fetchall()
+    pending = due = finished = 0
+    for status, kickoff in rows:
+        if status in ("won", "lost", "void"):
+            finished += 1
+        elif status == "pending":
+            pending += 1
+            try:
+                kick = datetime.fromisoformat(str(kickoff).replace("Z", "+00:00"))
+                if kick.tzinfo is None:
+                    kick = kick.replace(tzinfo=timezone.utc)
+                if kick + timedelta(hours=2, minutes=15) <= now:
+                    due += 1
+            except (ValueError, TypeError):
+                log.warning("Invalid kickoff in settlement summary")
+    return f"Published ledger: {finished} settled, {pending} pending, {due} due for result check"
+
+
 def main():
     if not os.getenv("API_FOOTBALL_KEY"):
         raise RuntimeError("API_FOOTBALL_KEY missing")
@@ -92,6 +117,7 @@ def main():
         if now >= next_settle:
             try:
                 log.info("Settled %s", v55_settle())
+                log.info("%s", settlement_summary())
             except Exception:
                 log.exception("v5.5 settlement failed")
             next_settle = time.monotonic() + 1800
