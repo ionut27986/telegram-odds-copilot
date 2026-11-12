@@ -106,9 +106,15 @@ def sync_telegram_v55():
     if data.get("version") != "5.5":
         raise RuntimeError("Telegram source is not v5.5")
     picks = data.get("picks", [])
-    if not picks:
-        log.warning("Telegram v5.5 source returned no published picks; keeping existing ledger")
+    # Demo-only source must never suppress real v5.5 scanning and settlement.
+    # The Telegram internal API currently serves an isolated test ledger.
+    real_picks = [p for p in picks
+                  if str(p.get("league") or "").strip().lower() != "oddplus demo"]
+    if not real_picks:
+        log.warning("Telegram v5.5 source has no real published picks; "
+                    "using independent v5.5 worker ledger instead")
         return False
+    picks = real_picks
     if not SYNC_URL or not SYNC_TOKEN:
         raise RuntimeError("OddPlus sync configuration missing")
     payload = json.dumps({"version": "5.5", "picks": picks}).encode("utf-8")
