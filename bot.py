@@ -2537,13 +2537,16 @@ async def v55_publish(app):
     return count
 
 
-def v55_settle():
+def v55_settle(min_created_at=None):
     """Settle published picks efficiently; never query games before likely full-time."""
     now = datetime.now(timezone.utc)
     with v55_db() as con:
         rows = con.execute(
             "SELECT id,fixture_id,market_kind,positive,threshold,kickoff "
             "FROM direct_picks_55 WHERE status='pending' AND published_at IS NOT NULL"
+            + (" AND created_at >= ?" if min_created_at else "")
+            + " ORDER BY kickoff DESC LIMIT 40",
+            (min_created_at,) if min_created_at else ()
         ).fetchall()
     changed = 0
     fixture_cache = {}
