@@ -2194,8 +2194,8 @@ def direct_research_53():
             if now + timedelta(minutes=MIN_LEAD_MINUTES+10) < kick <= end:
                 fixtures_by_id[fid] = (kick, game)
     selected = prioritize_football_fixtures(sorted(fixtures_by_id.values(), key=lambda v:v[0]))
-    # Conserve the shared API-Football quota for the active v5.5 feed.
-    selected = selected[:60]
+    # Keep broad fixture coverage for v5.5 selection quality.
+    selected = selected[:180]
     cache, direct, reverse = {}, [], []
     stats = {'fixtures':len(fixtures_by_id),'checked':0,'history':0,'priced':0,'errors':0}
     for kick, game in selected:
