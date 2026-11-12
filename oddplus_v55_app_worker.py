@@ -139,6 +139,7 @@ def main():
         pass
     with v55_db():
         pass
+    fresh_results_from = os.getenv('ODDPLUS_FRESH_RESULTS_FROM', '2026-11-13T00:00:00+00:00')
     next_scan = time.monotonic() + 30
     telegram_bridge_active = False
     next_bridge = time.monotonic()
@@ -160,9 +161,9 @@ def main():
                 log.exception("v5.5 scan failed")
             next_scan = time.monotonic() + max(1, V55_SCAN_INTERVAL_HOURS) * 3600
             next_sync = time.monotonic()
-        if os.getenv('ODDPLUS_SETTLE_OLD_PICKS', '0') == '1' and not telegram_bridge_active and now >= next_settle:
+        if not telegram_bridge_active and now >= next_settle:
             try:
-                log.info("Settled %s", v55_settle())
+                log.info("Settled %s fresh v5.5 picks", v55_settle(min_created_at=fresh_results_from))
                 log.info("%s", settlement_summary())
             except Exception:
                 log.exception("v5.5 settlement failed")
