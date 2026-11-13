@@ -2158,7 +2158,7 @@ async def weekendtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines=['🔬 OddX2 5.2 | WEEKEND RESEARCH',
             'READ-ONLY: no posts, bets, database reset or ROI changes.',
             f'Next 72h: {stats["fixtures"]} fixtures found; {stats["checked"]} checked; '
-            f'{stats["history"]} with enough history; {stats["priced"]} priced; API errors {stats["errors"]}.',
+            f'{stats["history"]} with enough history; {stats["priced"]} priced; API errors {stats["errors"]}; rejected {rejected}; duplicates {duplicate}; late {late}.',
             f'Direct EV: {len(direct)} distinct matches | Reverse Signal: {len(reverse)} distinct matches.',
             'DIRECT EV (1.80–2.20; model EV >= +5%, uncalibrated):']
         for x in direct[:30]:
@@ -2195,7 +2195,7 @@ def direct_research_53():
                 fixtures_by_id[fid] = (kick, game)
     selected = prioritize_football_fixtures(sorted(fixtures_by_id.values(), key=lambda v:v[0]))
     # Keep broad fixture coverage for v5.5 selection quality.
-    selected = selected[:45]
+    selected = selected[:90]
     cache, direct, reverse = {}, [], []
     stats = {'fixtures':len(fixtures_by_id),'checked':0,'history':0,'priced':0,'errors':0}
     for kick, game in selected:
@@ -2483,14 +2483,23 @@ def v55_scan():
                     (c['fixture'],now.isoformat(),c['kick'].isoformat(),c['league'],c['home'],c['away'],
                     c['selection'],c['odd'],c['model_ev'],reason,c['market_kind'],int(c['positive']),c['threshold']))
     count=0
+    rejected = {}
+    duplicate = 0
+    late = 0
     with v55_db() as con:
         for c in candidates:
-            if v55_rejection(c):
+            reason = v55_rejection(c)
+            if reason:
+                rejected[reason] = rejected.get(reason, 0) + 1
                 continue
-            if c['fixture'] in used or count>=min(V55_PER_SCAN_CAP,V55_DAILY_CAP-n_saved):
+            if c['fixture'] in used:
+                duplicate += 1
+                continue
+            if count>=min(V55_PER_SCAN_CAP,V55_DAILY_CAP-n_saved):
                 continue
             # Never publish already started events or odds discovered too late.
             if c['kick'] <= datetime.now(timezone.utc)+timedelta(minutes=MIN_LEAD_MINUTES+10):
+                late += 1
                 continue
             cur=con.execute("""INSERT OR IGNORE INTO direct_picks_55 (
                 fixture_id,created_at,kickoff,league,home,away,bookmaker,market,
