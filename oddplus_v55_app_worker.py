@@ -140,7 +140,7 @@ def main():
     with v55_db():
         pass
     # Reserve provider calls for overdue results before expensive research scans.
-    next_scan = time.monotonic() + 300
+    next_scan = time.monotonic() + 45
     telegram_bridge_active = False
     next_bridge = time.monotonic()
     # Settle the launch cohort promptly, without processing obsolete research.
