@@ -726,7 +726,7 @@ def settle_value_picks():
             status = (game.get('fixture') or {}).get('status',{}).get('short')
             if status in ('CANC','PST','ABD','AWD','WO'):
                 result, hg, ag = 'void', None, None
-            elif status == 'FT':
+            elif status in ('FT', 'AET', 'PEN'):
                 goals = game.get('goals') or {}
                 hg, ag = goals.get('home'),goals.get('away')
                 if not isinstance(hg,int) or not isinstance(ag,int):
@@ -2591,6 +2591,8 @@ def v55_settle(min_created_at=None):
             continue
         game = games[0]
         status = (game.get('fixture') or {}).get('status', {}).get('short')
+        log.info('v5.5 result check fixture=%s kickoff=%s provider_status=%s goals=%s',
+                 fixture, kickoff, status, game.get('goals'))
         if status in ('CANC', 'ABD', 'AWD', 'WO'):
             result, hg, ag = 'void', None, None
         elif status == 'FT':
