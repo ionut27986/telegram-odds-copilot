@@ -139,12 +139,13 @@ def main():
         pass
     with v55_db():
         pass
-    next_scan = time.monotonic() + 30
+    # Reserve provider calls for overdue results before expensive research scans.
+    next_scan = time.monotonic() + 300
     telegram_bridge_active = False
     next_bridge = time.monotonic()
     # Settle the launch cohort promptly, without processing obsolete research.
     fresh_results_from = os.getenv("ODDPLUS_FRESH_RESULTS_FROM", "2026-11-12T21:00:00+00:00")
-    next_settle = time.monotonic() + 60
+    next_settle = time.monotonic() + 10
     next_sync = time.monotonic() + 10
     while True:
         now = time.monotonic()
@@ -154,14 +155,6 @@ def main():
             except Exception:
                 log.exception("Telegram v5.5 bridge failed; existing ledger preserved")
             next_bridge = time.monotonic() + 300
-        if not telegram_bridge_active and now >= next_scan:
-            try:
-                log.info("%s", v55_scan())
-                log.info("Published %s", publish_to_ledger())
-            except Exception:
-                log.exception("v5.5 scan failed")
-            next_scan = time.monotonic() + max(1, V55_SCAN_INTERVAL_HOURS) * 3600
-            next_sync = time.monotonic()
         if not telegram_bridge_active and now >= next_settle:
             try:
                 log.info("Settled %s v5.5 picks", v55_settle(min_created_at=fresh_results_from))
@@ -169,6 +162,14 @@ def main():
             except Exception:
                 log.exception("v5.5 settlement failed")
             next_settle = time.monotonic() + 1800
+            next_sync = time.monotonic()
+        if not telegram_bridge_active and now >= next_scan:
+            try:
+                log.info("%s", v55_scan())
+                log.info("Published %s", publish_to_ledger())
+            except Exception:
+                log.exception("v5.5 scan failed")
+            next_scan = time.monotonic() + max(1, V55_SCAN_INTERVAL_HOURS) * 3600
             next_sync = time.monotonic()
         if not telegram_bridge_active and now >= next_sync:
             try:
