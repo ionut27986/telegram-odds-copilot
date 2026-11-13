@@ -49,7 +49,6 @@ def sync_to_api():
             "bookmaker,market,selection,odd,estimated,implied,estimated_ev,"
             "status,home_goals,away_goals FROM direct_picks_55 "
             "WHERE published_at IS NOT NULL "
-            "AND LOWER(TRIM(selection)) NOT LIKE 'under %' "
             "ORDER BY published_at DESC LIMIT 100"
         ).fetchall()
     if not rows:
@@ -140,7 +139,6 @@ def main():
         pass
     with v55_db():
         pass
-    fresh_results_from = os.getenv('ODDPLUS_FRESH_RESULTS_FROM', '2026-11-12T21:00:00+00:00')
     next_scan = time.monotonic() + 30
     telegram_bridge_active = False
     next_bridge = time.monotonic()
@@ -164,7 +162,7 @@ def main():
             next_sync = time.monotonic()
         if not telegram_bridge_active and now >= next_settle:
             try:
-                log.info("Settled %s fresh v5.5 picks", v55_settle(min_created_at=fresh_results_from))
+                log.info("Settled %s v5.5 picks", v55_settle())
                 log.info("%s", settlement_summary())
             except Exception:
                 log.exception("v5.5 settlement failed")
