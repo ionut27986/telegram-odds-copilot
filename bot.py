@@ -2195,7 +2195,7 @@ def direct_research_53():
                 fixtures_by_id[fid] = (kick, game)
     selected = prioritize_football_fixtures(sorted(fixtures_by_id.values(), key=lambda v:v[0]))
     # Keep broad fixture coverage for v5.5 selection quality.
-    selected = selected[:180]
+    selected = selected[:45]
     cache, direct, reverse = {}, [], []
     stats = {'fixtures':len(fixtures_by_id),'checked':0,'history':0,'priced':0,'errors':0}
     for kick, game in selected:
@@ -2214,6 +2214,12 @@ def direct_research_53():
         except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
             stats['errors'] += 1
             log.warning('Weekend research skip: %s', exc)
+            # Stop scanning immediately when the provider quota/rate limit is hit.
+            # Repeating hundreds of calls cannot create new valid picks.
+            if ('429' in str(exc) or 'request limit' in str(exc).lower()
+                    or 'too many requests' in str(exc).lower()):
+                log.warning('API-Football rate/quota limit: end scan early')
+                break
             continue
         if not prices:
             continue
