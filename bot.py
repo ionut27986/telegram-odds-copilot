@@ -2418,10 +2418,8 @@ async def v55_observations_command(update,context):
 
 # OddX2 5.5: independent public research cohort; historical tables never erased.
 # Every published event is one fixed hypothetical unit. No bets are placed.
-V55_DAILY_CAP = 40
-V55_PER_SCAN_CAP = 15
-V55_SCAN_INTERVAL_HOURS = 3
-V55_MAX_SCANS_DAY = 10
+V55_PER_SCAN_CAP = 15  # Prevent large bursts of publications in one scan
+V55_SCAN_INTERVAL_HOURS = 1  # Frequent discovery; no artificial daily scan cap
 
 
 def v55_db():
@@ -2459,12 +2457,6 @@ def v55_scan():
         saved = con.execute('SELECT created_at FROM direct_picks_55').fetchall()
         used = {r[0] for r in con.execute('SELECT fixture_id FROM direct_picks_55')}
         used.update(r[0] for r in con.execute('SELECT fixture_id FROM direct_picks_53'))
-    n_runs = sum(datetime.fromisoformat(r[0]).astimezone(LOCAL).date()==today for r in runs)
-    n_saved = sum(datetime.fromisoformat(r[0]).astimezone(LOCAL).date()==today for r in saved)
-    if n_runs >= V55_MAX_SCANS_DAY:
-        return 'Daily scan limit reached (API quota protection).'
-    if n_saved >= V55_DAILY_CAP:
-        return 'Daily research cap reached.'
     stats, candidates = direct_research_53()
     # Prospectively record excluded candidates to test the filter, never retroactively.
     with v55_db() as con:
@@ -2495,7 +2487,7 @@ def v55_scan():
             if c['fixture'] in used:
                 duplicate += 1
                 continue
-            if count>=min(V55_PER_SCAN_CAP,V55_DAILY_CAP-n_saved):
+            if count >= V55_PER_SCAN_CAP:
                 continue
             # Never publish already started events or odds discovered too late.
             if c['kick'] <= datetime.now(timezone.utc)+timedelta(minutes=MIN_LEAD_MINUTES+10):
