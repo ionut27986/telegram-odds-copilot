@@ -142,7 +142,8 @@ def main():
     next_scan = time.monotonic() + 30
     telegram_bridge_active = False
     next_bridge = time.monotonic()
-    next_settle = time.monotonic() + 1800
+    # Reconcile historical completed matches shortly after each deploy.
+    next_settle = time.monotonic() + 60
     next_sync = time.monotonic() + 10
     while True:
         now = time.monotonic()
