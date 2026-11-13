@@ -2545,8 +2545,9 @@ def v55_settle(min_created_at=None):
             "SELECT id,fixture_id,market_kind,positive,threshold,kickoff "
             "FROM direct_picks_55 WHERE status='pending' AND published_at IS NOT NULL"
             + (" AND created_at >= ?" if min_created_at else "")
-            + " ORDER BY kickoff DESC LIMIT 40",
-            (min_created_at,) if min_created_at else ()
+            + " AND kickoff <= ? ORDER BY kickoff ASC LIMIT 80",
+            (min_created_at, (now - timedelta(hours=2, minutes=15)).isoformat())
+            if min_created_at else ((now - timedelta(hours=2, minutes=15)).isoformat(),)
         ).fetchall()
     changed = 0
     fixture_cache = {}
