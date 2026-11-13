@@ -2881,6 +2881,32 @@ def main():
                              ('observations', v55_observations_command), ('alltime', value_report_command), ('markets', v54_market_command), ('quality', v54_quality_command), ('leagues', v54_league_command), ('diagnostics', diagnostics), ('footballaudit', footballaudit), ('pairaudit', pairaudit),
                              ('contextaudit', contextaudit_command), ('weekendtest', weekendtest_command), ('sports', sports), ('basketball', basketball_preview), ('hockey', hockey_preview), ('multiscan', multiscan_command), ('backtest', backtest_command), ('marketcheck', marketcheck_command)]:
         app.add_handler(CommandHandler(command, handler))
+    # One-time read-only diagnostic of the existing published v5.6 ledger.
+    try:
+        log.info("V56_AUDIT_BEGIN")
+        log.info("V56_AUDIT_REPORT\\n%s", v55_report('all'))
+        with v55_db() as audit_db:
+            rows = audit_db.execute(
+                "SELECT market_kind, selection, status, odd, estimated_ev, published_at "
+                "FROM direct_picks_55 WHERE published_at IS NOT NULL"
+            ).fetchall()
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for market, selection, status, odd, ev, published_at in rows:
+            groups[(str(market), str(selection))].append((status, float(odd), float(ev)))
+        for (market, selection), group in sorted(groups.items()):
+            won = [x for x in group if x[0] == 'won']
+            lost = [x for x in group if x[0] == 'lost']
+            pending = sum(x[0] == 'pending' for x in group)
+            settled = len(won) + len(lost)
+            pnl = sum(x[1] - 1 for x in won) - len(lost)
+            roi = pnl / settled * 100 if settled else 0.0
+            avg_odd = sum(x[1] for x in won + lost) / settled if settled else 0.0
+            log.info("V56_AUDIT_MARKET market=%s selection=%s total=%d won=%d lost=%d pending=%d avg_odd=%.3f pnl=%.3f roi_pct=%.2f",
+                     market, selection, len(group), len(won), len(lost), pending, avg_odd, pnl, roi)
+        log.info("V56_AUDIT_END")
+    except Exception:
+        log.exception("V56_AUDIT_FAILED")
     log.info('OddPlus 5.6-under-shadow-observations started')
     app.run_polling()
 
