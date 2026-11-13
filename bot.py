@@ -2892,8 +2892,8 @@ def main():
             ).fetchall()
         from collections import defaultdict
         groups = defaultdict(list)
-        for market, selection, status, odd, ev, published_at in rows:
-            groups[(str(market), str(selection))].append((status, float(odd), float(ev)))
+        for market, selection, pick_status, odd, ev, published_at in rows:
+            groups[(str(market), str(selection))].append((pick_status, float(odd), float(ev)))
         for (market, selection), group in sorted(groups.items()):
             won = [x for x in group if x[0] == 'won']
             lost = [x for x in group if x[0] == 'lost']
