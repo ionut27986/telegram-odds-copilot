@@ -142,7 +142,8 @@ def main():
     next_scan = time.monotonic() + 30
     telegram_bridge_active = False
     next_bridge = time.monotonic()
-    # Reconcile historical completed matches shortly after each deploy.
+    # Settle the launch cohort promptly, without processing obsolete research.
+    fresh_results_from = os.getenv("ODDPLUS_FRESH_RESULTS_FROM", "2026-11-12T21:00:00+00:00")
     next_settle = time.monotonic() + 60
     next_sync = time.monotonic() + 10
     while True:
@@ -163,7 +164,7 @@ def main():
             next_sync = time.monotonic()
         if not telegram_bridge_active and now >= next_settle:
             try:
-                log.info("Settled %s v5.5 picks", v55_settle())
+                log.info("Settled %s v5.5 picks", v55_settle(min_created_at=fresh_results_from))
                 log.info("%s", settlement_summary())
             except Exception:
                 log.exception("v5.5 settlement failed")
